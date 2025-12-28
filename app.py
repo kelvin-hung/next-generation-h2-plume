@@ -1,3 +1,6 @@
+import os, sys
+sys.path.append(os.path.dirname(__file__))
+
 import numpy as np
 import streamlit as st
 
@@ -56,16 +59,19 @@ if npz_file is None or csv_file is None:
     st.info("Upload NPZ (phi,k) and schedule CSV (t,q) to start.")
     st.stop()
 
-# Load inputs (cached by Streamlit automatically within session)
+# Load inputs
 try:
-    phi, k = read_npz_phi_k(npz_file)
+    phi, k, actmask = read_npz_phi_k(npz_file)
     t_sched, q_sched = read_schedule_csv(csv_file)
 except Exception as e:
     st.error(str(e))
     st.stop()
 
 nx, ny = phi.shape
-st.write(f"Loaded `phi`/`k` with shape **{phi.shape}**; schedule points: **{len(t_sched)}**.")
+active_pct = float(actmask.mean() * 100.0)
+
+st.write(f"Loaded `phi`/`k` shape **{phi.shape}** | schedule points: **{len(t_sched)}**")
+st.write(f"Active cells: **{active_pct:.1f}%** (inactive are handled safely).")
 
 # Well location
 col1, col2, col3 = st.columns([1, 1, 2])
@@ -78,12 +84,16 @@ with col3:
 
 # Quicklook maps
 with st.expander("Quicklook: phi and k maps", expanded=False):
+    # show inactive as NaN for display
+    phi_plot = np.where(actmask, phi, np.nan).astype(np.float32)
+    k_plot = np.where(actmask, k, np.nan).astype(np.float32)
+
     c1, c2 = st.columns(2)
     with c1:
-        st.pyplot(fig_imshow(phi, title="phi", vmin=float(np.min(phi)), vmax=float(np.max(phi))))
+        st.pyplot(fig_imshow(phi_plot, title="phi (masked inactive)"))
     with c2:
-        k_disp = np.log10(np.maximum(k, 1e-12))
-        st.pyplot(fig_imshow(k_disp, title="log10(k)", vmin=float(np.min(k_disp)), vmax=float(np.max(k_disp))))
+        k_disp = np.log10(np.maximum(k_plot, 1e-12))
+        st.pyplot(fig_imshow(k_disp, title="log10(k) (masked inactive)"))
 
 prm = ForwardParams(
     dx=float(dx), dy=float(dy), dt=float(dt), Nt=int(Nt),
