@@ -1,168 +1,237 @@
-import os, sys
-sys.path.append(os.path.dirname(__file__))
-
+import io
 import numpy as np
+import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
-from ve_core import (
-    read_npz_phi_k,
-    read_schedule_csv,
-    ForwardParams,
-    run_forward,
-    fig_imshow,
-    fig_line,
-    make_zip_bytes,
+from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
+
+st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
+
+st.title("VE + Darcy + Land: Forward plume prediction (paper model)")
+
+st.markdown(
+    """
+Upload **phi/k NPZ** and an **injection schedule CSV**, then run the paper model forward **without sg_obs**.
+
+**Expected NPZ keys**
+- `phi` : 2D array (nx, ny)
+- `k`   : 2D array (nx, ny)  (PERMX recommended)
+
+**Expected schedule CSV columns**
+- `t` : timestep index (0..Nt-1) or time
+- `q` : signed rate per timestep (positive=injection, negative=production)
+
+Tip: start with the sample files you generated (sample_phi_k.npz + sample_schedule.csv).
+"""
 )
 
-st.set_page_config(page_title="VE Forward Predictor", layout="wide")
-st.title("VE Forward Predictor (Upload phi/k NPZ + schedule CSV → Sg plume)")
+# -------------------------
+# Helpers
+# -------------------------
+def load_npz(uploaded):
+    data = np.load(uploaded)
+    if "phi" not in data or "k" not in data:
+        raise ValueError("NPZ must contain keys: phi and k")
+    meta = {}
+    for key in data.files:
+        if key not in ("phi", "k"):
+            try:
+                meta[key] = data[key]
+            except Exception:
+                pass
+    return data["phi"], data["k"], meta
 
-st.sidebar.header("Upload")
-npz_file = st.sidebar.file_uploader("NPZ file with arrays: phi, k", type=["npz"])
-csv_file = st.sidebar.file_uploader("Schedule CSV with columns: t, q", type=["csv"])
+def load_schedule_csv(uploaded):
+    df = pd.read_csv(uploaded)
+    df.columns = [c.lower().strip() for c in df.columns]
+    if "t" not in df.columns or "q" not in df.columns:
+        raise ValueError("CSV must have columns: t, q")
+    t = df["t"].to_numpy(dtype=np.float32)
+    q = df["q"].to_numpy(dtype=np.float32)
+    return t, q
 
-st.sidebar.header("Run settings")
-Nt = st.sidebar.slider("Nt (timesteps)", 20, 400, 80, 10)
-dt = st.sidebar.number_input("dt", value=1.0, format="%.6f")
-dx = st.sidebar.number_input("dx", value=1.0, format="%.6f")
-dy = st.sidebar.number_input("dy", value=1.0, format="%.6f")
-thr = st.sidebar.slider("Plume threshold (Sg ≥ thr)", 0.0, 0.5, 0.05, 0.01)
+def fig_imshow(arr, title, vmin=None, vmax=None):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title(title)
+    if vmin is None: vmin = float(np.nanmin(arr))
+    if vmax is None: vmax = float(np.nanmax(arr))
+    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax)
+    plt.xlabel("j")
+    plt.ylabel("i")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    return fig
 
-st.sidebar.header("Pressure driver")
-mu = st.sidebar.number_input("mu", value=1.0, format="%.6f")
-ct = st.sidebar.number_input("ct", value=1e-5, format="%.8f")
-p_substeps = st.sidebar.slider("pressure substeps", 1, 10, 2, 1)
+def fig_schedule(t, q, tidx=None):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title("Schedule q(t)")
+    plt.plot(t, q)
+    if tidx is not None and 0 <= tidx < len(t):
+        plt.axvline(t[tidx], linestyle="--")
+    plt.xlabel("t")
+    plt.ylabel("q")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
 
-st.sidebar.header("VE knobs")
-D0 = st.sidebar.number_input("D0", value=0.10, format="%.4f")
-anisD = st.sidebar.slider("anisD", 0.5, 2.0, 1.0, 0.05)
-vel_scale = st.sidebar.number_input("vel_scale", value=1.0, format="%.4f")
+def fig_timeseries(t, y, ylab, title):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title(title)
+    plt.plot(t, y)
+    plt.xlabel("t")
+    plt.ylabel(ylab)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
 
-src_amp = st.sidebar.number_input("src_amp", value=0.08, format="%.4f")
-rad_w = st.sidebar.slider("rad_w (cells)", 0.5, 10.0, 2.5, 0.1)
-prod_frac = st.sidebar.slider("prod_frac (if q<0)", 0.0, 1.0, 0.0, 0.01)
+# -------------------------
+# Sidebar inputs
+# -------------------------
+with st.sidebar:
+    st.header("1) Upload inputs")
+    up_npz = st.file_uploader("phi/k NPZ", type=["npz"])
+    up_csv = st.file_uploader("schedule CSV", type=["csv"])
 
-Swr = st.sidebar.slider("Swr", 0.0, 0.6, 0.10, 0.01)
-Sgr_max = st.sidebar.slider("Sgr_max", 0.0, 0.8, 0.20, 0.01)
-C_L = st.sidebar.slider("C_L (Land)", 0.01, 1.0, 0.15, 0.01)
+    st.divider()
+    st.header("2) Well location")
+    well_mode = st.selectbox("Well placement", ["max_k", "center", "manual"], index=0)
+    manual_i = st.number_input("manual i", value=0, step=1)
+    manual_j = st.number_input("manual j", value=0, step=1)
 
-mob_exp = st.sidebar.slider("mob_exp", 0.5, 3.0, 1.2, 0.05)
-hc = st.sidebar.slider("hc (k coupling)", 0.0, 0.5, 0.10, 0.01)
+    st.divider()
+    st.header("3) Schedule scaling")
+    q_scale = st.number_input("Schedule scale factor (multiplies q)", value=1.0)
+    normalize_q = st.checkbox("Normalize q to max(|q|)=1", value=False)
 
-run_btn = st.sidebar.button("🚀 Run forward simulation")
+    st.divider()
+    st.header("4) Output / metrics")
+    thr_area = st.slider("Area threshold (Sg > thr)", 0.0, 0.5, 0.05, 0.01)
 
-st.sidebar.markdown("---")
-include_snaps = st.sidebar.checkbox("Include snapshot PNGs in ZIP", value=True)
-snap_count = st.sidebar.slider("snapshot PNG count", 1, 20, 6, 1)
+    st.divider()
+    st.header("5) Paper parameters")
+    use_defaults = st.checkbox("Use paper-calibrated defaults", value=True)
 
-if npz_file is None or csv_file is None:
-    st.info("Upload NPZ (phi,k) and schedule CSV (t,q) to start.")
+    params = dict(DEFAULT_PARAMS)
+    if not use_defaults:
+        params["D0"] = st.number_input("D0", value=float(params["D0"]))
+        params["alpha_p"] = st.number_input("alpha_p", value=float(params["alpha_p"]))
+        params["src_amp"] = st.number_input("src_amp", value=float(params["src_amp"]))
+        params["prod_frac"] = st.number_input("prod_frac", value=float(params["prod_frac"]))
+        params["Swr"] = st.number_input("Swr", value=float(params["Swr"]))
+        params["Sgr_max"] = st.number_input("Sgr_max", value=float(params["Sgr_max"]))
+        params["C_L"] = st.number_input("C_L", value=float(params["C_L"]))
+        params["hc"] = st.number_input("hc", value=float(params["hc"]))
+        params["mob_exp"] = st.number_input("mob_exp", value=float(params["mob_exp"]))
+        params["anisD"] = st.number_input("anisD", value=float(params["anisD"]))
+        params["eps_h"] = st.number_input("eps_h", value=float(params["eps_h"]))
+        params["nu"] = st.number_input("nu", value=float(params["nu"]))
+        params["m_spread"] = st.number_input("m_spread", value=float(params["m_spread"]))
+        params["ap_diff"] = st.number_input("ap_diff", value=float(params["ap_diff"]))
+        params["qp_amp"] = st.number_input("qp_amp", value=float(params["qp_amp"]))
+
+    st.divider()
+    run_btn = st.button("Run forward prediction", type="primary")
+
+# -------------------------
+# Main logic
+# -------------------------
+if up_npz is None or up_csv is None:
+    st.info("Upload a phi/k NPZ and a schedule CSV to begin.")
     st.stop()
 
-# -----------------------------
-# Load inputs (robust)
-# -----------------------------
 try:
-    out = read_npz_phi_k(npz_file)
+    phi, k, meta = load_npz(up_npz)
+    t, q = load_schedule_csv(up_csv)
 
-    if isinstance(out, tuple) and len(out) == 3:
-        phi, k, actmask = out
-    elif isinstance(out, tuple) and len(out) == 2:
-        phi, k = out
-        actmask = np.isfinite(phi) & np.isfinite(k)
-
-        # sanitize (handles Norne NaNs)
-        phi = np.where(actmask, phi, 1.0).astype(np.float32)
-        k   = np.where(actmask, k, 0.0).astype(np.float32)
-    else:
-        raise RuntimeError("read_npz_phi_k must return (phi,k) or (phi,k,actmask)")
-
-    t_sched, q_sched = read_schedule_csv(csv_file)
+    q = q.astype(np.float32) * np.float32(q_scale)
+    if normalize_q:
+        m = float(np.max(np.abs(q))) if q.size else 1.0
+        if m > 0:
+            q = (q / m).astype(np.float32)
 
 except Exception as e:
-    st.error(str(e))
+    st.error(f"Failed to read inputs: {e}")
     st.stop()
 
-nx, ny = phi.shape
-active_pct = float(actmask.mean() * 100.0)
+# quick preview
+colA, colB = st.columns(2)
+with colA:
+    st.subheader("Input: porosity (phi)")
+    st.pyplot(fig_imshow(phi, f"phi | shape={phi.shape}"))
+with colB:
+    st.subheader("Input: permeability (k)")
+    st.pyplot(fig_imshow(k, f"k | shape={k.shape}"))
 
-st.write(f"Loaded `phi`/`k` shape **{phi.shape}** | schedule points: **{len(t_sched)}**")
-st.write(f"Active cells: **{active_pct:.1f}%** (inactive handled safely).")
+# compute well coordinate for display
+try:
+    _, k_norm, mask = prepare_phi_k(phi, k)
+    if well_mode == "manual":
+        well_ij = (int(manual_i), int(manual_j))
+    else:
+        well_ij = None
+    wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
+    st.caption(f"Selected well (i,j)=({wi},{wj}) | active cells={int(mask.sum())}")
+except Exception as e:
+    st.error(f"Input fields invalid: {e}")
+    st.stop()
 
-# Well location
-col1, col2, col3 = st.columns([1, 1, 2])
+st.subheader("Injection schedule")
+st.pyplot(fig_schedule(t, q, tidx=0))
+
+if not run_btn:
+    st.stop()
+
+with st.spinner("Running VE+Darcy+Land forward model..."):
+    try:
+        res = run_forward(
+            phi=phi,
+            k=k,
+            t=t,
+            q=q,
+            params=params,
+            well_mode=well_mode,
+            well_ij=(int(manual_i), int(manual_j)) if well_mode == "manual" else None,
+            return_pressure=True,
+            thr_area=float(thr_area),
+        )
+    except Exception as e:
+        st.error(f"Run failed: {e}")
+        st.stop()
+
+st.success("Done.")
+
+Nt = len(res.sg_list)
+tidx = st.slider("Select timestep (tidx)", 0, max(0, Nt - 1), min(0, Nt - 1))
+
+left, right = st.columns(2)
+with left:
+    st.subheader(f"Sg predicted | tidx={tidx}")
+    st.pyplot(fig_imshow(res.sg_list[tidx], f"Sg predicted | tidx={tidx}", vmin=0.0, vmax=1.0))
+with right:
+    st.subheader(f"Pressure surrogate | tidx={tidx}")
+    p = res.p_list[tidx] if res.p_list is not None else None
+    if p is None:
+        st.write("Pressure output disabled.")
+    else:
+        st.pyplot(fig_imshow(p, f"p predicted | tidx={tidx}"))
+
+col1, col2, col3 = st.columns(3)
 with col1:
-    wi = st.number_input("well i (row)", 0, nx - 1, nx // 2, 1)
+    st.subheader("q(t)")
+    st.pyplot(fig_schedule(res.t, res.q, tidx=tidx))
 with col2:
-    wj = st.number_input("well j (col)", 0, ny - 1, ny // 2, 1)
+    st.subheader("Plume area")
+    st.pyplot(fig_timeseries(res.t, res.area, "area (cells)", "Area time series"))
 with col3:
-    st.caption("Well is the source/sink location for q(t).")
+    st.subheader("Equivalent radius")
+    st.pyplot(fig_timeseries(res.t, res.r_eq, "r_eq (cells)", "Equivalent radius time series"))
 
-# Quicklook maps
-with st.expander("Quicklook: phi and k maps", expanded=False):
-    phi_plot = np.where(actmask, phi, np.nan).astype(np.float32)
-    k_plot = np.where(actmask, k, np.nan).astype(np.float32)
+st.subheader("Download results")
+out_npz = io.BytesIO()
+sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res.sg_list], axis=0).astype(np.float32)
+np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq)
+st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_name="sg_predicted.npz")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.pyplot(fig_imshow(phi_plot, title="phi (masked inactive)"))
-    with c2:
-        k_disp = np.log10(np.maximum(k_plot, 1e-12))
-        st.pyplot(fig_imshow(k_disp, title="log10(k) (masked inactive)"))
-
-prm = ForwardParams(
-    dx=float(dx), dy=float(dy), dt=float(dt), Nt=int(Nt),
-    mu=float(mu), ct=float(ct), p_substeps=int(p_substeps),
-    D0=float(D0), anisD=float(anisD), vel_scale=float(vel_scale),
-    src_amp=float(src_amp), rad_w=float(rad_w), prod_frac=float(prod_frac),
-    Swr=float(Swr), Sgr_max=float(Sgr_max), C_L=float(C_L),
-    mob_exp=float(mob_exp), hc=float(hc),
-)
-
-if "outputs" not in st.session_state:
-    st.session_state["outputs"] = None
-
-if run_btn:
-    with st.spinner("Running forward simulation..."):
-        outputs = run_forward(phi, k, t_sched, q_sched, (int(wi), int(wj)), prm, thr=float(thr))
-    st.session_state["outputs"] = outputs
-    st.success("Done!")
-
-outputs = st.session_state["outputs"]
-if outputs is None:
-    st.warning("Click **Run forward simulation** in the sidebar.")
-    st.stop()
-
-sg_list = outputs["sg_list"]
-t_grid = outputs["t_grid"]
-q_grid = outputs["q_grid"]
-
-st.subheader("Predicted plume")
-tidx = st.slider("tidx", 0, sg_list.shape[0] - 1, min(10, sg_list.shape[0] - 1), 1)
-
-cA, cB = st.columns([1, 1])
-with cA:
-    st.pyplot(fig_imshow(sg_list[tidx], title=f"Sg predicted | tidx={tidx}", vmin=0, vmax=1))
-with cB:
-    fig = fig_line(t_grid, q_grid, xlabel="t", ylabel="q", title="Schedule q(t)")
-    ax = fig.axes[0]
-    ax.axvline(float(t_grid[tidx]), linestyle="--")
-    st.pyplot(fig)
-
-st.subheader("Time series")
-c1, c2 = st.columns(2)
-with c1:
-    st.pyplot(fig_line(t_grid, outputs["area_ts"], xlabel="t", ylabel="area (cells)", title=f"area(t) for Sg ≥ {thr:.2f}"))
-with c2:
-    st.pyplot(fig_line(t_grid, outputs["r_eq_ts"], xlabel="t", ylabel="r_eq (cells)", title="Equivalent radius r_eq(t)"))
-
-# Export ZIP
-snap_ids = np.linspace(0, sg_list.shape[0] - 1, snap_count).round().astype(int).tolist()
-zip_bytes = make_zip_bytes(outputs, prm, float(thr), include_snapshots=bool(include_snaps), snap_ids=snap_ids)
-
-st.download_button(
-    "⬇️ Download ZIP (timeseries_plume.csv + params.json + optional snapshots)",
-    data=zip_bytes,
-    file_name="ve_forward_outputs.zip",
-    mime="application/zip",
-)
+out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
+st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
