@@ -1,5 +1,6 @@
 """
 VE + Darcy + Land forward model (paper version)
+
 - Takes phi/k 2D maps (np.ndarray)
 - Takes injection schedule q(t) (CSV or array)
 - Predicts Sg(t,i,j) sequence using:
@@ -48,6 +49,11 @@ DEFAULT_PARAMS: Dict[str, float] = {
     # Pressure surrogate (dimensionless calibration)
     "ap_diff": 0.03,
     "qp_amp": 1.0,
+
+    # Numerical stabilizers / switches
+    "pressure_use_div_k_grad": 1.0,   # 1.0=True, 0.0=False (fallback to k*laplacian)
+    "advection_nonperiodic": 1.0,     # 1.0=True, 0.0=False (fallback to np.roll)
+    "smooth_well_kernel": 1.0,        # 1.0=True, 0.0=False (flat square)
 }
 
 
@@ -90,18 +96,79 @@ def central_grad(a: np.ndarray, dx: float = 1.0, dy: float = 1.0) -> Tuple[np.nd
     return gx.astype(np.float32), gy.astype(np.float32)
 
 
-def upwind_advect(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float) -> np.ndarray:
-    """First-order upwind advection for scalar h."""
+def div_k_grad(p: np.ndarray, k: np.ndarray, dx: float = 1.0, dy: float = 1.0) -> np.ndarray:
+    """
+    Conservative operator: ∇·(k ∇p) using face (harmonic) transmissibilities.
+    p,k: (nx,ny)
+    """
+    p = p.astype(np.float32, copy=False)
+    k = k.astype(np.float32, copy=False)
+
+    pp = np.pad(p, ((1, 1), (1, 1)), mode="edge")
+    kp = np.pad(k, ((1, 1), (1, 1)), mode="edge")
+
+    pc = pp[1:-1, 1:-1]
+    pe = pp[2:, 1:-1]
+    pw = pp[:-2, 1:-1]
+    pn = pp[1:-1, 2:]
+    ps = pp[1:-1, :-2]
+
+    kc = kp[1:-1, 1:-1]
+    ke = kp[2:, 1:-1]
+    kw = kp[:-2, 1:-1]
+    kn = kp[1:-1, 2:]
+    ks = kp[1:-1, :-2]
+
+    # harmonic mean at faces (stable for high-contrast k)
+    kE = 2.0 * kc * ke / (kc + ke + 1e-12)
+    kW = 2.0 * kc * kw / (kc + kw + 1e-12)
+    kN = 2.0 * kc * kn / (kc + kn + 1e-12)
+    kS = 2.0 * kc * ks / (kc + ks + 1e-12)
+
+    dx2 = float(dx) ** 2
+    dy2 = float(dy) ** 2
+
+    fluxE = kE * (pe - pc) / dx2
+    fluxW = kW * (pc - pw) / dx2
+    fluxN = kN * (pn - pc) / dy2
+    fluxS = kS * (pc - ps) / dy2
+
+    return (fluxE - fluxW + fluxN - fluxS).astype(np.float32)
+
+
+def upwind_advect_nonperiodic(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float, dx: float = 1.0, dy: float = 1.0) -> np.ndarray:
+    """
+    First-order upwind advection with edge padding (NO periodic wrap).
+    """
     h = h.astype(np.float32, copy=False)
     ux = ux.astype(np.float32, copy=False)
     uy = uy.astype(np.float32, copy=False)
 
-    # x-direction (i)
+    hp = np.pad(h, ((1, 1), (1, 1)), mode="edge")
+    hc = hp[1:-1, 1:-1]
+    hE = hp[2:, 1:-1]
+    hW = hp[:-2, 1:-1]
+    hN = hp[1:-1, 2:]
+    hS = hp[1:-1, :-2]
+
+    dhdx = np.where(ux > 0, (hc - hW) / float(dx), (hE - hc) / float(dx))
+    dhdy = np.where(uy > 0, (hc - hS) / float(dy), (hN - hc) / float(dy))
+
+    return (hc - dt * (ux * dhdx + uy * dhdy)).astype(np.float32)
+
+
+def upwind_advect_periodic_roll(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float) -> np.ndarray:
+    """
+    Old behavior (periodic wrap). Kept only for debugging.
+    """
+    h = h.astype(np.float32, copy=False)
+    ux = ux.astype(np.float32, copy=False)
+    uy = uy.astype(np.float32, copy=False)
+
     h_up = np.roll(h, 1, axis=0)
     h_dn = np.roll(h, -1, axis=0)
     dhdx = np.where(ux > 0, h - h_up, h_dn - h)
 
-    # y-direction (j)
     h_lt = np.roll(h, 1, axis=1)
     h_rt = np.roll(h, -1, axis=1)
     dhdy = np.where(uy > 0, h - h_lt, h_rt - h)
@@ -176,10 +243,11 @@ def apply_well_source_sink(
     wj: int,
     rad_w: int,
     dt: float,
+    smooth_kernel: bool = True,
 ) -> np.ndarray:
     """
-    Apply injection (+) or production (-) around (wi,wj) in a small square stencil.
-    Mirrors the paper script behavior.
+    Apply injection (+) or production (-) around (wi,wj).
+    Smooth kernel prevents ring/checkerboard artifacts near well.
     """
     if q_sign == 0.0:
         return h
@@ -191,10 +259,20 @@ def apply_well_source_sink(
     j0, j1 = max(0, wj - r), min(ny, wj + r + 1)
 
     if q_sign > 0:
-        h[i0:i1, j0:j1] += np.float32(src_amp * q_w * dt)
+        if smooth_kernel:
+            sig2 = 2.0 * max(1.0, float(r)) ** 2
+            for ii in range(i0, i1):
+                for jj in range(j0, j1):
+                    di = float(ii - wi)
+                    dj = float(jj - wj)
+                    w = float(np.exp(-(di * di + dj * dj) / (sig2 + 1e-12)))
+                    h[ii, jj] += np.float32(src_amp * q_w * dt * w)
+        else:
+            h[i0:i1, j0:j1] += np.float32(src_amp * q_w * dt)
     else:
         # production removes a fraction of h
         h[i0:i1, j0:j1] *= np.float32(max(0.0, 1.0 - prod_frac * q_w * dt))
+
     return h
 
 
@@ -285,21 +363,25 @@ def simulate_pressure_from_schedule(
     qp_amp: float,
     dx: float,
     dy: float,
+    use_div_k_grad: bool = True,
 ) -> List[np.ndarray]:
     """
     Paper-compatible pressure surrogate:
+
+      p_{t+1} = p_t + ap_diff * ( ∇·(k_norm ∇p_t) ) + source(q_t)
+
+    If use_div_k_grad=False, falls back to legacy:
       p_{t+1} = p_t + ap_diff * (k_norm * laplacian(p_t)) + source(q_t)
-    Internally substeps for stability.
     """
     wi, wj = well_ij
     Nt = int(q.size)
     p = np.zeros_like(k_norm, dtype=np.float32)
     out: List[np.ndarray] = []
 
-    maxk = float(np.max(k_norm))
+    maxk = float(np.nanmax(k_norm))
     coefmax = (abs(float(ap_diff)) * maxk + 1e-12)
     dt_stable = 0.18 * (min(float(dx), float(dy)) ** 2) / coefmax
-    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 40))
+    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 60))
     dt = 1.0 / nsub
 
     rad = 1
@@ -307,8 +389,12 @@ def simulate_pressure_from_schedule(
     for t in range(Nt):
         qt = float(q[t])
         for _ in range(nsub):
-            div = laplacian(p)
-            p = p + (float(ap_diff) * dt) * (k_norm * div)
+            if use_div_k_grad:
+                div = div_k_grad(p, k_norm, dx=dx, dy=dy)
+                p = p + (float(ap_diff) * dt) * div
+            else:
+                div = laplacian(p)
+                p = p + (float(ap_diff) * dt) * (k_norm * div)
 
             if qt != 0.0:
                 i0, i1 = max(0, wi - rad), min(p.shape[0], wi + rad + 1)
@@ -352,12 +438,15 @@ def simulate_ve_from_pressure(
     mob_exp   = float(params.get("mob_exp", 1.2))
     anisD     = float(params.get("anisD", 1.0))
 
-    maxk = float(np.max(k_norm))
+    nonperiodic = bool(float(params.get("advection_nonperiodic", 1.0)) >= 0.5)
+    smooth_well = bool(float(params.get("smooth_well_kernel", 1.0)) >= 0.5)
+
+    maxk = float(np.nanmax(k_norm))
     D0x = D0 * anisD
     D0y = D0 / (anisD + 1e-12)
     coefmax = (max(D0x, D0y) * maxk * (1.0 + eps_h) ** max(1.0, m_spread) + nu)
     dt_stable = 0.18 * (min(dx, dy) ** 2) / (coefmax + 1e-12)
-    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 40))
+    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 80))
     dt = 1.0 / nsub
 
     h = np.zeros_like(p_list[0], dtype=np.float32)
@@ -379,10 +468,14 @@ def simulate_ve_from_pressure(
             q_sign, q_w = -1.0, abs(qt)
 
         for _ in range(nsub):
-            h = upwind_advect(h, ux, uy, dt=dt)
+            if nonperiodic:
+                h = upwind_advect_nonperiodic(h, ux, uy, dt=dt, dx=dx, dy=dy)
+            else:
+                h = upwind_advect_periodic_roll(h, ux, uy, dt=dt)
+
             h = k_spreading_power_aniso(h, k_norm, D0x=D0x, D0y=D0y, eps_h=eps_h, m_spread=m_spread, dt=dt)
             h = h + (nu * dt) * laplacian(h)
-            h = apply_well_source_sink(h, q_sign, q_w, src_amp, prod_frac, wi, wj, rad_w, dt=dt)
+            h = apply_well_source_sink(h, q_sign, q_w, src_amp, prod_frac, wi, wj, rad_w, dt=dt, smooth_kernel=smooth_well)
             h = np.clip(h, 0.0, 1.0).astype(np.float32)
 
         sg_mob = ve_mobile_sg_from_h(h, Swr=Swr, hc=hc, mob_exp=mob_exp).astype(np.float32)
@@ -432,7 +525,8 @@ def run_forward(
     t = np.asarray(t, dtype=np.float32).reshape(-1)
     if q.size != t.size:
         raise ValueError(f"t and q must have same length, got {t.size} vs {q.size}.")
-    Nt = int(q.size)
+
+    use_div = bool(float(params.get("pressure_use_div_k_grad", 1.0)) >= 0.5)
 
     p_list = simulate_pressure_from_schedule(
         k_norm=k_norm,
@@ -442,6 +536,7 @@ def run_forward(
         qp_amp=float(params.get("qp_amp", DEFAULT_PARAMS["qp_amp"])),
         dx=float(params.get("dx", 1.0)),
         dy=float(params.get("dy", 1.0)),
+        use_div_k_grad=use_div,
     )
 
     sg_list = simulate_ve_from_pressure(
