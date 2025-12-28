@@ -59,20 +59,26 @@ if npz_file is None or csv_file is None:
     st.info("Upload NPZ (phi,k) and schedule CSV (t,q) to start.")
     st.stop()
 
-# Load inputs
+# -----------------------------
+# Load inputs (robust)
+# -----------------------------
 try:
     out = read_npz_phi_k(npz_file)
-if isinstance(out, tuple) and len(out) == 3:
-    phi, k, actmask = out
-elif isinstance(out, tuple) and len(out) == 2:
-    phi, k = out
-    actmask = np.isfinite(phi) & np.isfinite(k)
-    # sanitize for solver safety
-    phi = np.where(actmask, phi, 1.0).astype(np.float32)
-    k   = np.where(actmask, k, 0.0).astype(np.float32)
-else:
-    raise RuntimeError("read_npz_phi_k must return (phi,k) or (phi,k,actmask)")
+
+    if isinstance(out, tuple) and len(out) == 3:
+        phi, k, actmask = out
+    elif isinstance(out, tuple) and len(out) == 2:
+        phi, k = out
+        actmask = np.isfinite(phi) & np.isfinite(k)
+
+        # sanitize (handles Norne NaNs)
+        phi = np.where(actmask, phi, 1.0).astype(np.float32)
+        k   = np.where(actmask, k, 0.0).astype(np.float32)
+    else:
+        raise RuntimeError("read_npz_phi_k must return (phi,k) or (phi,k,actmask)")
+
     t_sched, q_sched = read_schedule_csv(csv_file)
+
 except Exception as e:
     st.error(str(e))
     st.stop()
@@ -81,7 +87,7 @@ nx, ny = phi.shape
 active_pct = float(actmask.mean() * 100.0)
 
 st.write(f"Loaded `phi`/`k` shape **{phi.shape}** | schedule points: **{len(t_sched)}**")
-st.write(f"Active cells: **{active_pct:.1f}%** (inactive are handled safely).")
+st.write(f"Active cells: **{active_pct:.1f}%** (inactive handled safely).")
 
 # Well location
 col1, col2, col3 = st.columns([1, 1, 2])
@@ -94,7 +100,6 @@ with col3:
 
 # Quicklook maps
 with st.expander("Quicklook: phi and k maps", expanded=False):
-    # show inactive as NaN for display
     phi_plot = np.where(actmask, phi, np.nan).astype(np.float32)
     k_plot = np.where(actmask, k, np.nan).astype(np.float32)
 
@@ -161,5 +166,3 @@ st.download_button(
     file_name="ve_forward_outputs.zip",
     mime="application/zip",
 )
-
-
