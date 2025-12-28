@@ -308,3 +308,4 @@ def make_zip_bytes(outputs: Dict[str, np.ndarray],
 
     mem.seek(0)
     return mem.getvalue()
+
