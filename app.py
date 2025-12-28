@@ -1,13 +1,18 @@
-import os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import os
+import importlib.util
 
-import io
-import numpy as np
-import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
+HERE = os.path.dirname(os.path.abspath(__file__))
+VE_CORE_PATH = os.path.join(HERE, "ve_core.py")
 
-from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
+spec = importlib.util.spec_from_file_location("ve_core", VE_CORE_PATH)
+ve_core = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ve_core)
+
+DEFAULT_PARAMS = ve_core.DEFAULT_PARAMS
+run_forward     = ve_core.run_forward
+choose_well_ij  = ve_core.choose_well_ij
+prepare_phi_k   = ve_core.prepare_phi_k
+
 
 st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
 st.title("VE + Darcy + Land: Forward plume prediction (paper model)")
@@ -392,4 +397,5 @@ st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_
 
 out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
 st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
+
 
