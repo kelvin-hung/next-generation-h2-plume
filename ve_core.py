@@ -189,7 +189,7 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
     k_eff = geom_mean(k)
     k_norm = (k / (k_eff + 1e-12)).astype(np.float32)
 
-    # pressure diffusivity (safe because phi has no NaN after cleaning)
+    # pressure diffusivity
     alpha = (k / (np.maximum(phi, 1e-6) * prm.mu * prm.ct)).astype(np.float32)
 
     # time grid and interpolated schedule
@@ -214,7 +214,6 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
     for n in range(prm.Nt):
         qn = float(q_grid[n])
 
-        # source for dp/dt
         src_p = (qn * G).astype(np.float32)
 
         for _ in range(sub):
@@ -224,15 +223,12 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
         ux = (-(k / prm.mu) * gx * prm.vel_scale).astype(np.float32)
         uy = (-(k / prm.mu) * gy * prm.vel_scale).astype(np.float32)
 
-        # advect
         Sg_adv = upwind_advect(Sg, ux, uy, prm.dx, prm.dy, prm.dt)
 
-        # diffusion / spreading
         mob = np.power(np.clip(Sg, 0.0, 1.0) + 1e-6, float(prm.mob_exp)).astype(np.float32)
         D = (float(prm.D0) * (1.0 + float(prm.hc) * k_norm) * (0.25 + mob)).astype(np.float32)
         Sg_dif = diffuse_aniso(Sg_adv, D, prm.anisD, prm.dx, prm.dy, prm.dt)
 
-        # inject / produce effect on gas saturation
         if qn > 0:
             Sg_src = Sg_dif + float(prm.src_amp) * qn * G
         elif qn < 0 and prm.prod_frac > 0:
@@ -243,7 +239,6 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
         Sg_src = np.clip(Sg_src, 0.0, 1.0).astype(np.float32)
         Sg_max = np.maximum(Sg_max, Sg_src)
 
-        # residual trapping floor
         Sgr = land_trap_floor(Sg_max, prm.Sgr_max, prm.C_L)
         Sg = np.maximum(Sg_src, Sgr)
         Sg = np.clip(Sg, 0.0, 1.0 - float(prm.Swr)).astype(np.float32)
