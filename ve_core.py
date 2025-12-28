@@ -309,43 +309,66 @@ def simulate_sg(p_list: List[np.ndarray], k_norm: np.ndarray, mask: np.ndarray, 
     sg_max = np.zeros((nx, ny), dtype=np.float32)
     out: List[np.ndarray] = []
 
-    dt = 1.0
+   dt_outer = 1.0
 
-    k_eff = np.where(mask, k_norm, 0.0).astype(np.float32)
+for tt in range(len(q)):
+    p = np.where(np.isfinite(p_list[tt]), p_list[tt], 0.0).astype(np.float32)
 
-    for tt in range(len(q)):
-        p = np.where(np.isfinite(p_list[tt]), p_list[tt], 0.0).astype(np.float32)
+    dpx, dpy = grad_center(p, mask, dx, dy)
+    ux = -k_vel_scale * (k_eff * dpx)
+    uy = -k_vel_scale * (k_eff * dpy)
 
-        dpx, dpy = grad_center(p, mask, dx, dy)
-        ux = -k_vel_scale * (k_eff * dpx)
-        uy = -k_vel_scale * (k_eff * dpy)
+    if nu != 0.0:
+        ux = ux / (1.0 + nu * np.abs(ux))
+        uy = uy / (1.0 + nu * np.abs(uy))
 
-        if nu != 0.0:
-            ux = ux / (1.0 + nu * np.abs(ux))
-            uy = uy / (1.0 + nu * np.abs(uy))
+    # ---- stability / CFL ----
+    umax = float(np.nanmax(np.abs(ux[mask]))) if mask.any() else 0.0
+    vmax = float(np.nanmax(np.abs(uy[mask]))) if mask.any() else 0.0
+    max_u = max(umax, vmax)
 
+    # effective diffusion strength (very conservative but stable)
+    kmax = float(np.nanmax(k_eff[mask])) if mask.any() else 0.0
+    D_eff = float(D0 + abs(m_spread) * kmax)  # conservative
+
+    dt_adv  = 0.45 * min(dx, dy) / (max_u + 1e-8)            # advection CFL
+    dt_diff = 0.20 * min(dx*dx, dy*dy) / (D_eff + 1e-12)     # explicit diffusion stability
+
+    dt_sub = min(dt_outer, dt_adv, dt_diff)
+    nsub = int(np.ceil(dt_outer / dt_sub))
+    nsub = max(1, nsub)
+    dt = dt_outer / nsub
+
+    qt = float(q[tt])
+    inj = max(qt, 0.0)
+    prod = -min(qt, 0.0)
+
+    for _ in range(nsub):
         h_adv = upwind_advect(h, ux, uy, mask, dx, dy, dt)
 
         h_diff = D0 * laplace_masked(h_adv, mask, dx, dy, anisD)
 
-        # k-spreading term
+        # your spread term (kept), but now stable due to substeps
         h_spread = m_spread * laplace_masked(k_eff * h_adv, mask, dx, dy, anisD)
 
-        qt = float(q[tt])
-        inj = max(qt, 0.0)
-        prod = -min(qt, 0.0)
+        # sources scaled by dt
+        h_new = h_adv + dt * (
+            h_diff
+            + h_spread
+            + (src_amp * inj) * src
+            - (prod_frac * prod) * src
+        )
 
-        h_new = h_adv + dt * (h_diff + h_spread + (src_amp * inj) * src - (prod_frac * prod) * src)
-        h_new = np.where(mask, np.maximum(h_new, 0.0), 0.0).astype(np.float32)
+        h = np.where(mask, np.maximum(h_new, 0.0), 0.0).astype(np.float32)
 
-        sg_m = thickness_to_mobile_sg(h_new + eps_h, hc=hc, mob_exp=mob_exp)
-        sg_max = np.maximum(sg_max, sg_m)
-        sg_r = land_residual_from_max(sg_max, C_L=C_L, Sgr_max=Sgr_max)
+    # convert thickness -> Sg and apply Land residual
+    sg_m = thickness_to_mobile_sg(h + eps_h, hc=hc, mob_exp=mob_exp)
+    sg_max = np.maximum(sg_max, sg_m)
+    sg_r = land_residual_from_max(sg_max, C_L=C_L, Sgr_max=Sgr_max)
+    sg_tot = np.maximum(sg_m, sg_r)
 
-        sg_tot = np.maximum(sg_m, sg_r)
-        out.append(np.where(mask, sg_tot, np.nan).astype(np.float32))
+    out.append(np.where(mask, sg_tot, np.nan).astype(np.float32))
 
-        h = h_new
 
     return out
 
@@ -403,3 +426,4 @@ def run_forward(
         max_sg=max_sg,
         max_p=max_p,
     )
+
