@@ -13,17 +13,34 @@ import matplotlib.pyplot as plt
 # ---------------------------
 # IO helpers
 # ---------------------------
-def read_npz_phi_k(file_obj) -> Tuple[np.ndarray, np.ndarray]:
-    data = np.load(file_obj)
+def read_npz_phi_k(file_obj) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Loads phi/k from NPZ.
+    Handles inactive cells stored as NaN (common in Norne when ACTNUM applied).
+    Returns (phi_clean, k_clean, active_mask).
+    """
+    data = np.load(file_obj, allow_pickle=False)
     if "phi" not in data or "k" not in data:
         raise KeyError("NPZ must contain arrays with keys: 'phi' and 'k'")
+
     phi = np.array(data["phi"], dtype=np.float32)
     k = np.array(data["k"], dtype=np.float32)
+
     if phi.ndim != 2 or k.ndim != 2:
         raise ValueError("phi and k must be 2D arrays")
     if phi.shape != k.shape:
         raise ValueError(f"phi and k must have the same shape. Got {phi.shape} vs {k.shape}")
-    return phi, k
+
+    # active cells: both phi and k finite
+    active = np.isfinite(phi) & np.isfinite(k)
+
+    # Fill inactive with safe values:
+    # - k=0 => no flow
+    # - phi=1 => avoids NaN in denominators (alpha will be 0 anyway because k=0)
+    phi_clean = np.where(active, phi, 1.0).astype(np.float32)
+    k_clean = np.where(active, k, 0.0).astype(np.float32)
+
+    return phi_clean, k_clean, active
 
 
 def read_schedule_csv(file_obj) -> Tuple[np.ndarray, np.ndarray]:
@@ -43,7 +60,7 @@ def read_schedule_csv(file_obj) -> Tuple[np.ndarray, np.ndarray]:
 # Numerics
 # ---------------------------
 def geom_mean(x: np.ndarray, eps: float = 1e-12) -> float:
-    x = np.asarray(x)
+    x = np.asarray(x, dtype=np.float32)
     return float(np.exp(np.mean(np.log(np.maximum(x, eps)))))
 
 
@@ -172,7 +189,7 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
     k_eff = geom_mean(k)
     k_norm = (k / (k_eff + 1e-12)).astype(np.float32)
 
-    # pressure diffusivity
+    # pressure diffusivity (safe because phi has no NaN after cleaning)
     alpha = (k / (np.maximum(phi, 1e-6) * prm.mu * prm.ct)).astype(np.float32)
 
     # time grid and interpolated schedule
@@ -254,8 +271,21 @@ def run_forward(phi: np.ndarray, k: np.ndarray,
 # Plot + export
 # ---------------------------
 def fig_imshow(arr: np.ndarray, title: str = "", vmin=None, vmax=None):
+    arr = np.array(arr, dtype=np.float32)
+    valid = np.isfinite(arr)
+    if not np.any(valid):
+        fig, ax = plt.subplots()
+        ax.set_title(title + " (no finite values)")
+        ax.axis("off")
+        return fig
+
+    if vmin is None:
+        vmin = float(np.nanmin(arr))
+    if vmax is None:
+        vmax = float(np.nanmax(arr))
+
     fig, ax = plt.subplots()
-    im = ax.imshow(arr, vmin=vmin, vmax=vmax)
+    im = ax.imshow(np.ma.masked_invalid(arr), vmin=vmin, vmax=vmax)
     ax.set_title(title)
     ax.set_xlabel("j")
     ax.set_ylabel("i")
@@ -308,4 +338,3 @@ def make_zip_bytes(outputs: Dict[str, np.ndarray],
 
     mem.seek(0)
     return mem.getvalue()
-
