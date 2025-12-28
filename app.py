@@ -61,7 +61,18 @@ if npz_file is None or csv_file is None:
 
 # Load inputs
 try:
-    phi, k, actmask = read_npz_phi_k(npz_file)
+    out = read_npz_phi_k(npz_file)
+if isinstance(out, tuple) and len(out) == 3:
+    phi, k, actmask = out
+elif isinstance(out, tuple) and len(out) == 2:
+    phi, k = out
+    actmask = np.isfinite(phi) & np.isfinite(k)
+    # sanitize for solver safety
+    phi = np.where(actmask, phi, 1.0).astype(np.float32)
+    k   = np.where(actmask, k, 0.0).astype(np.float32)
+else:
+    raise RuntimeError("read_npz_phi_k must return (phi,k) or (phi,k,actmask)")
+
     t_sched, q_sched = read_schedule_csv(csv_file)
 except Exception as e:
     st.error(str(e))
@@ -151,3 +162,4 @@ st.download_button(
     file_name="ve_forward_outputs.zip",
     mime="application/zip",
 )
+
