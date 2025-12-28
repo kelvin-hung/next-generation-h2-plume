@@ -1,8 +1,4 @@
 import os
-print("CWD:", os.getcwd())
-print("FILES:", os.listdir("."))
-print("APP DIR FILES:", os.listdir(os.path.dirname(os.path.abspath(__file__))))
-
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -16,6 +12,7 @@ DEFAULT_PARAMS = ve_core.DEFAULT_PARAMS
 run_forward     = ve_core.run_forward
 choose_well_ij  = ve_core.choose_well_ij
 prepare_phi_k   = ve_core.prepare_phi_k
+
 
 
 st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
@@ -401,6 +398,7 @@ st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_
 
 out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
 st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
+
 
 
 
