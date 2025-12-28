@@ -1,584 +1,270 @@
-"""
-VE + Darcy + Land forward model (paper version)
-
-- Takes phi/k 2D maps (np.ndarray)
-- Takes injection schedule q(t) (CSV or array)
-- Predicts Sg(t,i,j) sequence using:
-    * pressure surrogate (diffusion + source) -> Darcy velocity
-    * VE thickness h evolution (advection + k-spreading + diffusion + source/sink)
-    * capillary-fringe mapping (hc, mob_exp) -> mobile Sg
-    * Land hysteresis -> residual Sg
-    * total Sg = max(mobile, residual)
-
-This file is meant to be imported by Streamlit (app.py).
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
+import io
 import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
 
+from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
+
+st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
+st.title("VE + Darcy + Land: Forward plume prediction (paper model)")
+
+st.markdown(
+    """
+Upload **phi/k NPZ** and an **injection schedule CSV**, then run the paper model forward **without sg_obs**.
+
+**Expected NPZ keys**
+- `phi` : 2D array (nx, ny)
+- `k`   : 2D array (nx, ny)  (PERMX recommended)
+
+**Expected schedule CSV columns**
+- `t` : timestep index (0..Nt-1) or time
+- `q` : signed rate per timestep (positive=injection, negative=production)
+"""
+)
 
 # -------------------------
-# Parameters (from your paper script)
+# Sample generator (for testing)
 # -------------------------
+def make_sample_phi_k(nx=80, ny=120, seed=7):
+    rng = np.random.default_rng(seed)
+    ii = np.linspace(0, 1, nx)[:, None]
+    jj = np.linspace(0, 1, ny)[None, :]
+    phi = 0.22 + 0.06*np.sin(2*np.pi*ii) * np.cos(2*np.pi*jj)
+    phi += 0.01*rng.standard_normal((nx, ny))
+    phi = np.clip(phi, 0.05, 0.35).astype(np.float32)
 
-DEFAULT_PARAMS: Dict[str, float] = {
-    # Core VE parameters (paper-calibrated defaults)
-    "D0": 0.27802127542157334,
-    "alpha_p": 0.3035718747536404,
-    "src_amp": 289.9128164502606,
-    "prod_frac": 0.21370220515124894,
-    "Swr": 0.32291144862162,
-    "Sgr_max": 0.07441779469199929,
-    "C_L": 0.5969969351350207,
-    "eps_h": 0.08728309474730092,
-    "nu": 0.0010582605526077622,
-    "m_spread": 2.731778941305009,
-    "rad_w": 1,
-    "dx": 1.0,
-    "dy": 1.0,
+    logk = 2.2 + 0.5*np.sin(2*np.pi*jj) + 0.3*np.cos(2*np.pi*ii)
+    logk += 0.08*rng.standard_normal((nx, ny))
+    k = (10**logk).astype(np.float32)
 
-    # Capillary fringe + anisotropy
-    "hc": 0.10,
-    "mob_exp": 1.20,
-    "anisD": 1.00,
+    # inactive mask (a "cut-out" region)
+    mask = np.ones((nx, ny), dtype=bool)
+    mask[:6, :10] = False
+    mask[-8:, -12:] = False
+    phi[~mask] = np.nan
+    k[~mask] = np.nan
+    return phi, k
 
-    # Pressure surrogate (dimensionless calibration)
-    "ap_diff": 0.03,
-    "qp_amp": 1.0,
-
-    # Numerical stabilizers / switches
-    "pressure_use_div_k_grad": 1.0,   # 1.0=True, 0.0=False (fallback to k*laplacian)
-    "advection_nonperiodic": 1.0,     # 1.0=True, 0.0=False (fallback to np.roll)
-    "smooth_well_kernel": 1.0,        # 1.0=True, 0.0=False (flat square)
-}
-
-
-@dataclass
-class ForwardResult:
-    sg_list: List[np.ndarray]            # length Nt, each (nx,ny) masked (inactive -> NaN)
-    p_list: Optional[List[np.ndarray]]   # length Nt, each (nx,ny)
-    area: np.ndarray                     # (Nt,)
-    r_eq: np.ndarray                     # (Nt,)
-    q: np.ndarray                        # (Nt,)
-    t: np.ndarray                        # (Nt,)
-
+def make_sample_schedule(Nt=80):
+    t = np.arange(Nt, dtype=np.float32)
+    q = np.zeros(Nt, dtype=np.float32)
+    q[:20] = 1.0
+    q[20:30] = np.linspace(1.0, 0.0, 10, dtype=np.float32)
+    q[30:40] = np.linspace(0.0, -0.5, 10, dtype=np.float32)
+    q[40:60] = np.linspace(-0.5, 0.0, 20, dtype=np.float32)
+    q[60:] = 0.0
+    return t, q
 
 # -------------------------
-# Numeric utilities
+# Helpers
 # -------------------------
+def load_npz(uploaded):
+    data = np.load(uploaded)
+    if "phi" not in data or "k" not in data:
+        raise ValueError("NPZ must contain keys: phi and k")
+    meta = {k: data[k] for k in data.files if k not in ("phi", "k")}
+    return data["phi"], data["k"], meta
 
-def _nan_to_num_inplace(a: np.ndarray, val: float = 0.0) -> np.ndarray:
-    """Return a float32 array with NaNs/Infs replaced."""
-    out = a.astype(np.float32, copy=True)
-    bad = ~np.isfinite(out)
-    if bad.any():
-        out[bad] = np.float32(val)
-    return out
+def load_schedule_csv(uploaded):
+    df = pd.read_csv(uploaded)
+    df.columns = [c.lower().strip() for c in df.columns]
+    if "t" not in df.columns or "q" not in df.columns:
+        raise ValueError("CSV must have columns: t, q")
+    t = df["t"].to_numpy(dtype=np.float32)
+    q = df["q"].to_numpy(dtype=np.float32)
+    return t, q
 
+def fig_imshow(arr, title, vmin=None, vmax=None):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title(title)
+    if vmin is None: vmin = float(np.nanmin(arr))
+    if vmax is None: vmax = float(np.nanmax(arr))
+    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax)
+    plt.xlabel("j")
+    plt.ylabel("i")
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    return fig
 
-def laplacian(a: np.ndarray) -> np.ndarray:
-    """5-point Laplacian with Neumann-like edge handling via padding."""
-    a = a.astype(np.float32, copy=False)
-    ap = np.pad(a, ((1, 1), (1, 1)), mode="edge")
-    return (ap[1:-1, 2:] + ap[1:-1, :-2] + ap[2:, 1:-1] + ap[:-2, 1:-1] - 4.0 * ap[1:-1, 1:-1]).astype(np.float32)
+def fig_schedule(t, q, tidx=None):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title("Schedule q(t)")
+    plt.plot(t, q)
+    if tidx is not None and 0 <= tidx < len(t):
+        plt.axvline(t[tidx], linestyle="--")
+    plt.xlabel("t")
+    plt.ylabel("q")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
 
-
-def central_grad(a: np.ndarray, dx: float = 1.0, dy: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Central gradient (∂/∂x along i, ∂/∂y along j) with edge padding."""
-    a = a.astype(np.float32, copy=False)
-    ap = np.pad(a, ((1, 1), (1, 1)), mode="edge")
-    gx = (ap[2:, 1:-1] - ap[:-2, 1:-1]) / (2.0 * float(dx))
-    gy = (ap[1:-1, 2:] - ap[1:-1, :-2]) / (2.0 * float(dy))
-    return gx.astype(np.float32), gy.astype(np.float32)
-
-
-def div_k_grad(p: np.ndarray, k: np.ndarray, dx: float = 1.0, dy: float = 1.0) -> np.ndarray:
-    """
-    Conservative operator: ∇·(k ∇p) using face (harmonic) transmissibilities.
-    p,k: (nx,ny)
-    """
-    p = p.astype(np.float32, copy=False)
-    k = k.astype(np.float32, copy=False)
-
-    pp = np.pad(p, ((1, 1), (1, 1)), mode="edge")
-    kp = np.pad(k, ((1, 1), (1, 1)), mode="edge")
-
-    pc = pp[1:-1, 1:-1]
-    pe = pp[2:, 1:-1]
-    pw = pp[:-2, 1:-1]
-    pn = pp[1:-1, 2:]
-    ps = pp[1:-1, :-2]
-
-    kc = kp[1:-1, 1:-1]
-    ke = kp[2:, 1:-1]
-    kw = kp[:-2, 1:-1]
-    kn = kp[1:-1, 2:]
-    ks = kp[1:-1, :-2]
-
-    # harmonic mean at faces (stable for high-contrast k)
-    kE = 2.0 * kc * ke / (kc + ke + 1e-12)
-    kW = 2.0 * kc * kw / (kc + kw + 1e-12)
-    kN = 2.0 * kc * kn / (kc + kn + 1e-12)
-    kS = 2.0 * kc * ks / (kc + ks + 1e-12)
-
-    dx2 = float(dx) ** 2
-    dy2 = float(dy) ** 2
-
-    fluxE = kE * (pe - pc) / dx2
-    fluxW = kW * (pc - pw) / dx2
-    fluxN = kN * (pn - pc) / dy2
-    fluxS = kS * (pc - ps) / dy2
-
-    return (fluxE - fluxW + fluxN - fluxS).astype(np.float32)
-
-
-def upwind_advect_nonperiodic(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float, dx: float = 1.0, dy: float = 1.0) -> np.ndarray:
-    """
-    First-order upwind advection with edge padding (NO periodic wrap).
-    """
-    h = h.astype(np.float32, copy=False)
-    ux = ux.astype(np.float32, copy=False)
-    uy = uy.astype(np.float32, copy=False)
-
-    hp = np.pad(h, ((1, 1), (1, 1)), mode="edge")
-    hc = hp[1:-1, 1:-1]
-    hE = hp[2:, 1:-1]
-    hW = hp[:-2, 1:-1]
-    hN = hp[1:-1, 2:]
-    hS = hp[1:-1, :-2]
-
-    dhdx = np.where(ux > 0, (hc - hW) / float(dx), (hE - hc) / float(dx))
-    dhdy = np.where(uy > 0, (hc - hS) / float(dy), (hN - hc) / float(dy))
-
-    return (hc - dt * (ux * dhdx + uy * dhdy)).astype(np.float32)
-
-
-def upwind_advect_periodic_roll(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float) -> np.ndarray:
-    """
-    Old behavior (periodic wrap). Kept only for debugging.
-    """
-    h = h.astype(np.float32, copy=False)
-    ux = ux.astype(np.float32, copy=False)
-    uy = uy.astype(np.float32, copy=False)
-
-    h_up = np.roll(h, 1, axis=0)
-    h_dn = np.roll(h, -1, axis=0)
-    dhdx = np.where(ux > 0, h - h_up, h_dn - h)
-
-    h_lt = np.roll(h, 1, axis=1)
-    h_rt = np.roll(h, -1, axis=1)
-    dhdy = np.where(uy > 0, h - h_lt, h_rt - h)
-
-    return (h - dt * (ux * dhdx + uy * dhdy)).astype(np.float32)
-
-
-def k_spreading_power_aniso(
-    h: np.ndarray,
-    k_norm: np.ndarray,
-    D0x: float,
-    D0y: float,
-    eps_h: float,
-    m_spread: float,
-    dt: float,
-) -> np.ndarray:
-    """
-    Nonlinear k-controlled spreading term (paper):
-      flux ~ D0 * k * (h+eps)^m * grad(h)
-    Implemented in a conservative finite-volume-ish way.
-    """
-    h = h.astype(np.float32, copy=False)
-    k_norm = k_norm.astype(np.float32, copy=False)
-
-    hp = np.pad(h, ((1, 1), (1, 1)), mode="edge")
-    kp = np.pad(k_norm, ((1, 1), (1, 1)), mode="edge")
-
-    h_c = hp[1:-1, 1:-1]
-    h_e = hp[2:, 1:-1]
-    h_w = hp[:-2, 1:-1]
-    h_n = hp[1:-1, 2:]
-    h_s = hp[1:-1, :-2]
-
-    k_c = kp[1:-1, 1:-1]
-    k_e = kp[2:, 1:-1]
-    k_w = kp[:-2, 1:-1]
-    k_n = kp[1:-1, 2:]
-    k_s = kp[1:-1, :-2]
-
-    # harmonic-ish mean for k at faces
-    ke = 2.0 * k_c * k_e / (k_c + k_e + 1e-12)
-    kw = 2.0 * k_c * k_w / (k_c + k_w + 1e-12)
-    kn = 2.0 * k_c * k_n / (k_c + k_n + 1e-12)
-    ks = 2.0 * k_c * k_s / (k_c + k_s + 1e-12)
-
-    he = 0.5 * (h_c + h_e)
-    hw = 0.5 * (h_c + h_w)
-    hn = 0.5 * (h_c + h_n)
-    hs = 0.5 * (h_c + h_s)
-
-    Ce = D0x * ke * np.power(np.maximum(he + eps_h, 0.0), m_spread)
-    Cw = D0x * kw * np.power(np.maximum(hw + eps_h, 0.0), m_spread)
-    Cn = D0y * kn * np.power(np.maximum(hn + eps_h, 0.0), m_spread)
-    Cs = D0y * ks * np.power(np.maximum(hs + eps_h, 0.0), m_spread)
-
-    Fe = Ce * (h_e - h_c)
-    Fw = Cw * (h_c - h_w)
-    Fn = Cn * (h_c - h_n)
-    Fs = Cs * (h_s - h_c)
-
-    divF = (Fe - Fw) + (Fs - Fn)
-    return (h + dt * divF).astype(np.float32)
-
-
-def apply_well_source_sink(
-    h: np.ndarray,
-    q_sign: float,
-    q_w: float,
-    src_amp: float,
-    prod_frac: float,
-    wi: int,
-    wj: int,
-    rad_w: int,
-    dt: float,
-    smooth_kernel: bool = True,
-) -> np.ndarray:
-    """
-    Apply injection (+) or production (-) around (wi,wj).
-    Smooth kernel prevents ring/checkerboard artifacts near well.
-    """
-    if q_sign == 0.0:
-        return h
-
-    h = h.astype(np.float32, copy=False)
-    nx, ny = h.shape
-    r = int(max(0, rad_w))
-    i0, i1 = max(0, wi - r), min(nx, wi + r + 1)
-    j0, j1 = max(0, wj - r), min(ny, wj + r + 1)
-
-    if q_sign > 0:
-        if smooth_kernel:
-            sig2 = 2.0 * max(1.0, float(r)) ** 2
-            for ii in range(i0, i1):
-                for jj in range(j0, j1):
-                    di = float(ii - wi)
-                    dj = float(jj - wj)
-                    w = float(np.exp(-(di * di + dj * dj) / (sig2 + 1e-12)))
-                    h[ii, jj] += np.float32(src_amp * q_w * dt * w)
-        else:
-            h[i0:i1, j0:j1] += np.float32(src_amp * q_w * dt)
-    else:
-        # production removes a fraction of h
-        h[i0:i1, j0:j1] *= np.float32(max(0.0, 1.0 - prod_frac * q_w * dt))
-
-    return h
-
+def fig_timeseries(t, y, ylab, title):
+    fig = plt.figure(figsize=(7.2, 4.6))
+    plt.title(title)
+    plt.plot(t, y)
+    plt.xlabel("t")
+    plt.ylabel(ylab)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
 
 # -------------------------
-# VE saturation + hysteresis
+# Sidebar inputs
 # -------------------------
+with st.sidebar:
+    st.header("Quick test (no upload)")
+    if st.button("Use built-in sample inputs"):
+        phi_s, k_s = make_sample_phi_k()
+        t_s, q_s = make_sample_schedule()
+        sample_npz = io.BytesIO()
+        np.savez_compressed(sample_npz, phi=phi_s, k=k_s)
+        st.download_button("Download sample_phi_k.npz", sample_npz.getvalue(), file_name="sample_phi_k.npz")
+        sample_csv = pd.DataFrame({"t": t_s, "q": q_s}).to_csv(index=False).encode("utf-8")
+        st.download_button("Download sample_schedule.csv", sample_csv, file_name="sample_schedule.csv")
 
-def ve_mobile_sg_from_h(h: np.ndarray, Swr: float, hc: float, mob_exp: float) -> np.ndarray:
-    """
-    Capillary/fringe mapping:
-      eff = clip((h - hc)/(1-hc), 0, 1)
-      Sg_mob = (1-Swr) * eff^mob_exp
-    """
-    hc = float(np.clip(hc, 0.0, 0.9))
-    eff = np.clip((h - hc) / (1.0 - hc + 1e-12), 0.0, 1.0)
-    eff = np.power(eff, max(0.25, float(mob_exp)))
-    return ((1.0 - float(Swr)) * eff).astype(np.float32)
+    st.divider()
+    st.header("1) Upload inputs")
+    up_npz = st.file_uploader("phi/k NPZ", type=["npz"])
+    up_csv = st.file_uploader("schedule CSV", type=["csv"])
 
+    st.divider()
+    st.header("2) Well location")
+    well_mode = st.selectbox("Well placement", ["max_k", "center", "manual"], index=0)
+    manual_i = st.number_input("manual i", value=0, step=1)
+    manual_j = st.number_input("manual j", value=0, step=1)
 
-def land_residual(Sg_max: np.ndarray, Sgr_max: float, C_L: float) -> np.ndarray:
-    return (float(Sgr_max) * (Sg_max / (Sg_max + float(C_L) + 1e-12))).astype(np.float32)
+    st.divider()
+    st.header("3) Schedule scaling")
+    q_scale = st.number_input("Schedule scale factor (multiplies q)", value=1.0)
+    normalize_q = st.checkbox("Normalize q to max(|q|)=1", value=False)
 
+    st.divider()
+    st.header("4) Output / metrics")
+    thr_area = st.slider("Area threshold (Sg > thr)", 0.0, 0.5, 0.05, 0.01)
 
-# -------------------------
-# Input prep
-# -------------------------
+    st.divider()
+    st.header("5) Paper parameters")
+    use_defaults = st.checkbox("Use paper-calibrated defaults", value=True)
 
-def prepare_phi_k(phi: np.ndarray, k: np.ndarray, *, k_is_log10: bool = False,
-                  k_floor: float = 1e-6, k_cap: float = 1e6) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Robust input sanitizer:
-    - phi must be finite and >0 for active cells
-    - k MUST be positive for active cells
-    - supports k given as log10(k) (set k_is_log10=True)
-    - clips k to [k_floor, k_cap] to avoid extremes
-    Returns:
-      phi_clean (float32, inactive->1)
-      k_norm   (float32, inactive->0)
-      mask     (bool) active cells
-    """
-    phi = phi.astype(np.float32, copy=False)
-    k   = k.astype(np.float32, copy=False)
+    params = dict(DEFAULT_PARAMS)
+    if not use_defaults:
+        for kkey in list(params.keys()):
+            # keep UI sane: show only “core” params, not the whole dict if you want
+            params[kkey] = st.number_input(kkey, value=float(params[kkey]))
 
-    # optional log10(k) -> k (linear)
-    if k_is_log10:
-        k = np.power(10.0, k, dtype=np.float32)
-
-    # replace non-finite
-    phi = np.where(np.isfinite(phi), phi, np.nan).astype(np.float32)
-    k   = np.where(np.isfinite(k),   k,   np.nan).astype(np.float32)
-
-    # active mask
-    mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0)
-
-    if mask.sum() == 0:
-        raise ValueError("No active cells found (phi/k all invalid or phi<=0).")
-
-    # enforce positive k on active cells
-    k_lin = np.where(mask, k, np.nan)
-    k_lin = np.where(mask, np.clip(k_lin, k_floor, k_cap), np.nan).astype(np.float32)
-
-    # clean arrays for math
-    phi_clean = np.where(mask, phi, 1.0).astype(np.float32)
-    k_clean   = np.where(mask, k_lin, 0.0).astype(np.float32)
-
-    # geometric mean normalization (robust)
-    k_pos = k_clean[mask]
-    k_pos = k_pos[k_pos > 0]
-    k_eff = float(np.exp(np.mean(np.log(k_pos + 1e-30)))) if k_pos.size else 1.0
-    k_norm = (k_clean / (k_eff + 1e-12)).astype(np.float32)
-
-    # IMPORTANT: k_norm must be nonnegative
-    k_norm = np.maximum(k_norm, 0.0).astype(np.float32)
-
-    return phi_clean, k_norm, mask
-
-
-
-def choose_well_ij(k_norm: np.ndarray, mask: np.ndarray, mode: str, ij: Tuple[int, int] | None = None) -> Tuple[int, int]:
-    nx, ny = k_norm.shape
-    if mode == "max_k":
-        tmp = np.where(mask, k_norm, -np.inf)
-        wi, wj = np.unravel_index(int(np.argmax(tmp)), tmp.shape)
-        return int(wi), int(wj)
-    if mode == "center":
-        ii, jj = np.where(mask)
-        wi = int(np.round(np.mean(ii)))
-        wj = int(np.round(np.mean(jj)))
-        return wi, wj
-    if mode == "manual":
-        if ij is None:
-            raise ValueError("manual mode requires ij.")
-        wi, wj = int(ij[0]), int(ij[1])
-        wi = int(np.clip(wi, 0, nx - 1))
-        wj = int(np.clip(wj, 0, ny - 1))
-        return wi, wj
-    raise ValueError("mode must be one of: max_k, center, manual")
-
+    st.divider()
+    run_btn = st.button("Run forward prediction", type="primary")
 
 # -------------------------
-# Pressure surrogate (paper)
+# Main logic
 # -------------------------
+if up_npz is None or up_csv is None:
+    st.info("Upload a phi/k NPZ and a schedule CSV to begin (or use the sample downloads in the sidebar).")
+    st.stop()
 
-def simulate_pressure_from_schedule(
-    k_norm: np.ndarray,
-    well_ij: Tuple[int, int],
-    q: np.ndarray,
-    ap_diff: float,
-    qp_amp: float,
-    dx: float,
-    dy: float,
-    use_div_k_grad: bool = True,
-) -> List[np.ndarray]:
-    """
-    Paper-compatible pressure surrogate:
+try:
+    phi, k, meta = load_npz(up_npz)
+    t, q = load_schedule_csv(up_csv)
 
-      p_{t+1} = p_t + ap_diff * ( ∇·(k_norm ∇p_t) ) + source(q_t)
+    q = q.astype(np.float32) * np.float32(q_scale)
+    if normalize_q:
+        m = float(np.max(np.abs(q))) if q.size else 1.0
+        if m > 0:
+            q = (q / m).astype(np.float32)
 
-    If use_div_k_grad=False, falls back to legacy:
-      p_{t+1} = p_t + ap_diff * (k_norm * laplacian(p_t)) + source(q_t)
-    """
-    wi, wj = well_ij
-    Nt = int(q.size)
-    p = np.zeros_like(k_norm, dtype=np.float32)
-    out: List[np.ndarray] = []
+except Exception as e:
+    st.error(f"Failed to read inputs: {e}")
+    st.stop()
 
-    maxk = float(np.nanmax(k_norm))
-    coefmax = (abs(float(ap_diff)) * maxk + 1e-12)
-    dt_stable = 0.18 * (min(float(dx), float(dy)) ** 2) / coefmax
-    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 60))
-    dt = 1.0 / nsub
+# quick preview
+colA, colB = st.columns(2)
+with colA:
+    st.subheader("Input: porosity (phi)")
+    st.pyplot(fig_imshow(phi, f"phi | shape={phi.shape}"))
+with colB:
+    st.subheader("Input: permeability (k)")
+    st.pyplot(fig_imshow(k, f"k | shape={k.shape}"))
 
-    rad = 1
+with st.expander("Debug: NPZ meta + masks", expanded=False):
+    st.write("NPZ meta keys:", list(meta.keys()))
+    try:
+        _, k_norm, mask = prepare_phi_k(phi, k)
+        st.write("Active cells:", int(mask.sum()), " / ", int(mask.size))
+        st.pyplot(fig_imshow(mask.astype(np.float32), "active mask (1=active)", vmin=0.0, vmax=1.0))
+        st.pyplot(fig_imshow(np.log10(np.where(mask, np.maximum(k_norm, 1e-12), np.nan)), "log10(k_norm) (masked)"))
+    except Exception as e:
+        st.warning(f"prepare_phi_k failed: {e}")
 
-    for t in range(Nt):
-        qt = float(q[t])
-        for _ in range(nsub):
-            if use_div_k_grad:
-                div = div_k_grad(p, k_norm, dx=dx, dy=dy)
-                p = p + (float(ap_diff) * dt) * div
-            else:
-                div = laplacian(p)
-                p = p + (float(ap_diff) * dt) * (k_norm * div)
-
-            if qt != 0.0:
-                i0, i1 = max(0, wi - rad), min(p.shape[0], wi + rad + 1)
-                j0, j1 = max(0, wj - rad), min(p.shape[1], wj + rad + 1)
-                p[i0:i1, j0:j1] += np.float32(float(qp_amp) * qt * dt)
-
-        out.append(p.astype(np.float32, copy=True))
-
-    return out
-
-
-# -------------------------
-# VE forward solve (paper)
-# -------------------------
-
-def simulate_ve_from_pressure(
-    p_list: List[np.ndarray],
-    k_norm: np.ndarray,
-    well_ij: Tuple[int, int],
-    q: np.ndarray,
-    params: Dict[str, float],
-) -> List[np.ndarray]:
-    wi, wj = well_ij
-    Nt = len(p_list)
-
-    dx = float(params.get("dx", 1.0))
-    dy = float(params.get("dy", 1.0))
-
-    D0        = float(params["D0"])
-    alpha_p   = float(params["alpha_p"])
-    src_amp   = float(params["src_amp"])
-    prod_frac = float(params["prod_frac"])
-    Swr       = float(params["Swr"])
-    Sgr_max   = float(params["Sgr_max"])
-    C_L       = float(params["C_L"])
-    eps_h     = float(params["eps_h"])
-    nu        = float(params["nu"])
-    m_spread  = float(params["m_spread"])
-    rad_w     = int(params.get("rad_w", 1))
-    hc        = float(params.get("hc", 0.10))
-    mob_exp   = float(params.get("mob_exp", 1.2))
-    anisD     = float(params.get("anisD", 1.0))
-
-    nonperiodic = bool(float(params.get("advection_nonperiodic", 1.0)) >= 0.5)
-    smooth_well = bool(float(params.get("smooth_well_kernel", 1.0)) >= 0.5)
-
-    maxk = float(np.nanmax(k_norm))
-    D0x = D0 * anisD
-    D0y = D0 / (anisD + 1e-12)
-    coefmax = (max(D0x, D0y) * maxk * (1.0 + eps_h) ** max(1.0, m_spread) + nu)
-    dt_stable = 0.18 * (min(dx, dy) ** 2) / (coefmax + 1e-12)
-    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 80))
-    dt = 1.0 / nsub
-
-    h = np.zeros_like(p_list[0], dtype=np.float32)
-    Sg_max_hist = np.zeros_like(h, dtype=np.float32)
-
-    sg_pred: List[np.ndarray] = []
-
-    for t in range(Nt):
-        gx, gy = central_grad(p_list[t], dx=dx, dy=dy)
-        ux = (-alpha_p * k_norm * gx).astype(np.float32)
-        uy = (-alpha_p * k_norm * gy).astype(np.float32)
-
-        qt = float(q[t])
-        q_sign = 0.0
-        q_w = 0.0
-        if qt > 0:
-            q_sign, q_w = 1.0, abs(qt)
-        elif qt < 0:
-            q_sign, q_w = -1.0, abs(qt)
-
-        for _ in range(nsub):
-            if nonperiodic:
-                h = upwind_advect_nonperiodic(h, ux, uy, dt=dt, dx=dx, dy=dy)
-            else:
-                h = upwind_advect_periodic_roll(h, ux, uy, dt=dt)
-
-            h = k_spreading_power_aniso(h, k_norm, D0x=D0x, D0y=D0y, eps_h=eps_h, m_spread=m_spread, dt=dt)
-            h = h + (nu * dt) * laplacian(h)
-            h = apply_well_source_sink(h, q_sign, q_w, src_amp, prod_frac, wi, wj, rad_w, dt=dt, smooth_kernel=smooth_well)
-            h = np.clip(h, 0.0, 1.0).astype(np.float32)
-
-        sg_mob = ve_mobile_sg_from_h(h, Swr=Swr, hc=hc, mob_exp=mob_exp).astype(np.float32)
-        Sg_max_hist = np.maximum(Sg_max_hist, sg_mob)
-        sg_res = land_residual(Sg_max_hist, Sgr_max=Sgr_max, C_L=C_L).astype(np.float32)
-        sg_tot = np.maximum(sg_mob, sg_res)
-        sg_tot = np.clip(sg_tot, 0.0, 1.0).astype(np.float32)
-
-        sg_pred.append(sg_tot)
-
-    return sg_pred
-
-
-# -------------------------
-# Public forward API
-# -------------------------
-
-def run_forward(
-    phi: np.ndarray,
-    k: np.ndarray,
-    t: np.ndarray,
-    q: np.ndarray,
-    params: Optional[Dict[str, float]] = None,
-    well_mode: str = "max_k",
-    well_ij: Optional[Tuple[int, int]] = None,
-    return_pressure: bool = True,
-    thr_area: float = 0.05,
-) -> ForwardResult:
-    """
-    Forward prediction without sg_obs:
-      (phi,k) + schedule -> pressure surrogate -> VE -> sg(t)
-
-    Inputs:
-      t,q: arrays length Nt. (t can be 0..Nt-1)
-    """
-    if params is None:
-        params = dict(DEFAULT_PARAMS)
-    else:
-        merged = dict(DEFAULT_PARAMS)
-        merged.update(params)
-        params = merged
-
+# compute well coordinate for display
+try:
     _, k_norm, mask = prepare_phi_k(phi, k)
-    wi, wj = choose_well_ij(k_norm, mask, mode=well_mode, ij=well_ij)
+    if well_mode == "manual":
+        well_ij = (int(manual_i), int(manual_j))
+    else:
+        well_ij = None
+    wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
+    st.caption(f"Selected well (i,j)=({wi},{wj}) | active cells={int(mask.sum())}")
+except Exception as e:
+    st.error(f"Input fields invalid: {e}")
+    st.stop()
 
-    q = np.asarray(q, dtype=np.float32).reshape(-1)
-    t = np.asarray(t, dtype=np.float32).reshape(-1)
-    if q.size != t.size:
-        raise ValueError(f"t and q must have same length, got {t.size} vs {q.size}.")
+st.subheader("Injection schedule")
+st.pyplot(fig_schedule(t, q, tidx=0))
 
-    use_div = bool(float(params.get("pressure_use_div_k_grad", 1.0)) >= 0.5)
+if not run_btn:
+    st.stop()
 
-    p_list = simulate_pressure_from_schedule(
-        k_norm=k_norm,
-        well_ij=(wi, wj),
-        q=q,
-        ap_diff=float(params.get("ap_diff", DEFAULT_PARAMS["ap_diff"])),
-        qp_amp=float(params.get("qp_amp", DEFAULT_PARAMS["qp_amp"])),
-        dx=float(params.get("dx", 1.0)),
-        dy=float(params.get("dy", 1.0)),
-        use_div_k_grad=use_div,
-    )
+with st.spinner("Running VE+Darcy+Land forward model..."):
+    try:
+        res = run_forward(
+            phi=phi,
+            k=k,
+            t=t,
+            q=q,
+            params=params,
+            well_mode=well_mode,
+            well_ij=(int(manual_i), int(manual_j)) if well_mode == "manual" else None,
+            return_pressure=True,
+            thr_area=float(thr_area),
+        )
+    except Exception as e:
+        st.error(f"Run failed: {e}")
+        st.stop()
 
-    sg_list = simulate_ve_from_pressure(
-        p_list=p_list,
-        k_norm=k_norm,
-        well_ij=(wi, wj),
-        q=q,
-        params=params,
-    )
+st.success("Done.")
 
-    sg_masked = [np.where(mask, s, np.nan).astype(np.float32) for s in sg_list]
+Nt = len(res.sg_list)
+tidx = st.slider("Select timestep (tidx)", 0, max(0, Nt - 1), 0)
 
-    area = np.array([float(np.nansum(s > thr_area)) for s in sg_masked], dtype=np.float32)
-    r_eq = np.sqrt(area / np.pi).astype(np.float32)
+left, right = st.columns(2)
+with left:
+    st.subheader(f"Sg predicted | tidx={tidx}")
+    st.pyplot(fig_imshow(res.sg_list[tidx], f"Sg predicted | tidx={tidx}", vmin=0.0, vmax=1.0))
+with right:
+    st.subheader(f"Pressure surrogate | tidx={tidx}")
+    p = res.p_list[tidx] if res.p_list is not None else None
+    if p is None:
+        st.write("Pressure output disabled.")
+    else:
+        st.pyplot(fig_imshow(p, f"p predicted | tidx={tidx}"))
 
-    return ForwardResult(
-        sg_list=sg_masked,
-        p_list=p_list if return_pressure else None,
-        area=area,
-        r_eq=r_eq,
-        q=q.astype(np.float32),
-        t=t.astype(np.float32),
-    )
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.subheader("q(t)")
+    st.pyplot(fig_schedule(res.t, res.q, tidx=tidx))
+with col2:
+    st.subheader("Plume area")
+    st.pyplot(fig_timeseries(res.t, res.area, "area (cells)", "Area time series"))
+with col3:
+    st.subheader("Equivalent radius")
+    st.pyplot(fig_timeseries(res.t, res.r_eq, "r_eq (cells)", "Equivalent radius time series"))
 
+st.subheader("Download results")
+out_npz = io.BytesIO()
+sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res.sg_list], axis=0).astype(np.float32)
+np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq)
+st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_name="sg_predicted.npz")
+
+out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
+st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
