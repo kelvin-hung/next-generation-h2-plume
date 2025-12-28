@@ -300,34 +300,55 @@ def land_residual(Sg_max: np.ndarray, Sgr_max: float, C_L: float) -> np.ndarray:
 # Input prep
 # -------------------------
 
-def prepare_phi_k(phi: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def prepare_phi_k(phi: np.ndarray, k: np.ndarray, *, k_is_log10: bool = False,
+                  k_floor: float = 1e-6, k_cap: float = 1e6) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
+    Robust input sanitizer:
+    - phi must be finite and >0 for active cells
+    - k MUST be positive for active cells
+    - supports k given as log10(k) (set k_is_log10=True)
+    - clips k to [k_floor, k_cap] to avoid extremes
     Returns:
-      phi_clean (float32, with inactive set to 1)
-      k_norm (float32, inactive set to 0)
-      mask (bool) active cells
+      phi_clean (float32, inactive->1)
+      k_norm   (float32, inactive->0)
+      mask     (bool) active cells
     """
-    phi = _nan_to_num_inplace(phi, val=np.nan)
-    k = _nan_to_num_inplace(k, val=np.nan)
+    phi = phi.astype(np.float32, copy=False)
+    k   = k.astype(np.float32, copy=False)
 
+    # optional log10(k) -> k (linear)
+    if k_is_log10:
+        k = np.power(10.0, k, dtype=np.float32)
+
+    # replace non-finite
+    phi = np.where(np.isfinite(phi), phi, np.nan).astype(np.float32)
+    k   = np.where(np.isfinite(k),   k,   np.nan).astype(np.float32)
+
+    # active mask
     mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0)
+
     if mask.sum() == 0:
-        raise ValueError("No active cells found in phi/k (all NaN or non-positive).")
+        raise ValueError("No active cells found (phi/k all invalid or phi<=0).")
 
-    # clean fields for simulation
+    # enforce positive k on active cells
+    k_lin = np.where(mask, k, np.nan)
+    k_lin = np.where(mask, np.clip(k_lin, k_floor, k_cap), np.nan).astype(np.float32)
+
+    # clean arrays for math
     phi_clean = np.where(mask, phi, 1.0).astype(np.float32)
-    k_clean = np.where(mask, k, 0.0).astype(np.float32)
+    k_clean   = np.where(mask, k_lin, 0.0).astype(np.float32)
 
-    # k normalization: geometric mean over active cells (robust)
+    # geometric mean normalization (robust)
     k_pos = k_clean[mask]
     k_pos = k_pos[k_pos > 0]
-    if k_pos.size == 0:
-        k_eff = 1.0
-    else:
-        k_eff = float(np.exp(np.mean(np.log(k_pos + 1e-30))))
+    k_eff = float(np.exp(np.mean(np.log(k_pos + 1e-30)))) if k_pos.size else 1.0
     k_norm = (k_clean / (k_eff + 1e-12)).astype(np.float32)
 
+    # IMPORTANT: k_norm must be nonnegative
+    k_norm = np.maximum(k_norm, 0.0).astype(np.float32)
+
     return phi_clean, k_norm, mask
+
 
 
 def choose_well_ij(k_norm: np.ndarray, mask: np.ndarray, mode: str, ij: Tuple[int, int] | None = None) -> Tuple[int, int]:
@@ -560,3 +581,4 @@ def run_forward(
         q=q.astype(np.float32),
         t=t.astype(np.float32),
     )
+
