@@ -1,3 +1,6 @@
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import io
 import numpy as np
 import pandas as pd
@@ -389,3 +392,4 @@ st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_
 
 out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
 st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
+
