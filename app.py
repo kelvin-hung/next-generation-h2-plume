@@ -72,7 +72,6 @@ elif isinstance(out, tuple) and len(out) == 2:
     k   = np.where(actmask, k, 0.0).astype(np.float32)
 else:
     raise RuntimeError("read_npz_phi_k must return (phi,k) or (phi,k,actmask)")
-
     t_sched, q_sched = read_schedule_csv(csv_file)
 except Exception as e:
     st.error(str(e))
@@ -162,4 +161,5 @@ st.download_button(
     file_name="ve_forward_outputs.zip",
     mime="application/zip",
 )
+
 
