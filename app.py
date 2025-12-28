@@ -1,4 +1,8 @@
 import os
+print("CWD:", os.getcwd())
+print("FILES:", os.listdir("."))
+print("APP DIR FILES:", os.listdir(os.path.dirname(os.path.abspath(__file__))))
+
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -397,5 +401,6 @@ st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_
 
 out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
 st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
+
 
 
