@@ -1,32 +1,12 @@
 import io
-import os
-import sys
-import traceback
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# --- Make sure repo root is importable ---
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
-
-# --- Import ve_core safely (show full error in Streamlit if it fails) ---
-try:
-    import ve_core
-    DEFAULT_PARAMS = ve_core.DEFAULT_PARAMS
-    run_forward = ve_core.run_forward
-    choose_well_ij = ve_core.choose_well_ij
-    prepare_phi_k = ve_core.prepare_phi_k
-except Exception:
-    st.error("Failed to import ve_core.py. Full traceback:")
-    st.code(traceback.format_exc())
-    st.stop()
-
+from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
 
 st.set_page_config(page_title="VE+Darcy+Land Forward Predictor", layout="wide")
 st.title("VE + Darcy + Land: Forward plume prediction (paper model)")
@@ -40,50 +20,54 @@ Upload **phi/k NPZ** and an **injection schedule CSV**, then run the paper model
 - `k`   : 2D array (nx, ny)  (PERMX recommended)
 
 **Expected schedule CSV columns**
-- `t` : timestep index (0..Nt-1) or time
-- `q` : signed rate per timestep (positive=injection, negative=production)
+- `t` : timestep index or time (monotonic)
+- `q` : signed rate per step (positive=injection, negative=production)
+
+**If results look "too small" on Norne**
+1) Turn on **Normalize q** (default).
+2) Use well placement **max_k**.
+3) If still tiny, increase `qp_amp` and `src_amp` (try 2×, 5×, 10×).
 """
 )
 
 # -------------------------
 # Helpers
 # -------------------------
-@st.cache_data(show_spinner=False)
-def load_npz_bytes(b: bytes):
-    bio = io.BytesIO(b)
-    data = np.load(bio)
+def load_npz(uploaded) -> Tuple[np.ndarray, np.ndarray, dict]:
+    data = np.load(uploaded, allow_pickle=True)
     if "phi" not in data or "k" not in data:
         raise ValueError("NPZ must contain keys: phi and k")
-    phi = data["phi"]
-    k = data["k"]
-    meta = {key: data[key] for key in data.files if key not in ("phi", "k")}
+    meta = {k: data[k] for k in data.files if k not in ("phi", "k")}
+    phi = np.asarray(data["phi"], dtype=np.float32)
+    k = np.asarray(data["k"], dtype=np.float32)
+    if phi.ndim != 2 or k.ndim != 2:
+        raise ValueError(f"phi and k must be 2D arrays, got phi.ndim={phi.ndim}, k.ndim={k.ndim}")
+    if phi.shape != k.shape:
+        raise ValueError(f"phi and k must have same shape, got {phi.shape} vs {k.shape}")
     return phi, k, meta
 
-@st.cache_data(show_spinner=False)
-def load_schedule_csv_bytes(b: bytes):
-    bio = io.BytesIO(b)
-    df = pd.read_csv(bio)
+def load_schedule_csv(uploaded) -> Tuple[np.ndarray, np.ndarray]:
+    df = pd.read_csv(uploaded)
     df.columns = [c.lower().strip() for c in df.columns]
     if "t" not in df.columns or "q" not in df.columns:
         raise ValueError("CSV must have columns: t, q")
     t = df["t"].to_numpy(dtype=np.float32)
     q = df["q"].to_numpy(dtype=np.float32)
-    return t, q
+    m = np.isfinite(t) & np.isfinite(q)
+    t, q = t[m], q[m]
+    if t.size < 2:
+        raise ValueError("Schedule too short after cleaning.")
+    s = np.argsort(t)
+    return t[s], q[s]
 
 def fig_imshow(arr, title, vmin=None, vmax=None):
     fig = plt.figure(figsize=(7.2, 4.6))
     plt.title(title)
-
-    a = np.array(arr, copy=False)
-    cmap = plt.get_cmap("viridis").copy()
-    cmap.set_bad(color="white")  # NaN/inactive
-
     if vmin is None:
-        vmin = float(np.nanmin(a)) if np.isfinite(a).any() else 0.0
+        vmin = float(np.nanmin(arr))
     if vmax is None:
-        vmax = float(np.nanmax(a)) if np.isfinite(a).any() else 1.0
-
-    im = plt.imshow(a, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap)
+        vmax = float(np.nanmax(arr))
+    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, aspect="auto")
     plt.xlabel("j")
     plt.ylabel("i")
     plt.colorbar(im, fraction=0.046, pad=0.04)
@@ -112,46 +96,10 @@ def fig_timeseries(t, y, ylab, title):
     plt.tight_layout()
     return fig
 
-def make_sample_phi_k(nx=110, ny=45):
-    phi = np.full((nx, ny), 0.25, dtype=np.float32)
-    k = np.full((nx, ny), 100.0, dtype=np.float32)
-    # add smooth heterogeneity
-    ii = np.linspace(-1, 1, nx, dtype=np.float32)[:, None]
-    jj = np.linspace(-1, 1, ny, dtype=np.float32)[None, :]
-    blob = np.exp(-3.0 * (ii**2 + (1.5*jj)**2)).astype(np.float32)
-    k = k * (1.0 + 3.0 * blob)
-    # inactive border
-    phi[:8, :] = np.nan
-    phi[-6:, :] = np.nan
-    phi[:, :6] = np.nan
-    phi[:, -6:] = np.nan
-    k[~np.isfinite(phi)] = np.nan
-    return phi, k
-
-def make_sample_schedule(Nt=80):
-    t = np.arange(Nt, dtype=np.float32)
-    q = np.zeros(Nt, dtype=np.float32)
-    q[:20] = 1.0
-    q[20:30] = np.linspace(1.0, 0.0, 10, dtype=np.float32)
-    q[30:40] = np.linspace(0.0, -0.5, 10, dtype=np.float32)
-    q[40:60] = np.linspace(-0.5, 0.0, 20, dtype=np.float32)
-    return t, q
-
-
 # -------------------------
-# Sidebar inputs
+# Sidebar
 # -------------------------
 with st.sidebar:
-    st.header("0) Quick test (optional)")
-    if st.button("Use built-in sample inputs"):
-        phi_s, k_s = make_sample_phi_k()
-        t_s, q_s = make_sample_schedule()
-        buf = io.BytesIO()
-        np.savez_compressed(buf, phi=phi_s, k=k_s)
-        st.session_state["_npz_bytes"] = buf.getvalue()
-        st.session_state["_csv_bytes"] = pd.DataFrame({"t": t_s, "q": q_s}).to_csv(index=False).encode("utf-8")
-
-    st.divider()
     st.header("1) Upload inputs")
     up_npz = st.file_uploader("phi/k NPZ", type=["npz"])
     up_csv = st.file_uploader("schedule CSV", type=["csv"])
@@ -165,7 +113,7 @@ with st.sidebar:
     st.divider()
     st.header("3) Schedule scaling")
     q_scale = st.number_input("Schedule scale factor (multiplies q)", value=1.0)
-    normalize_q = st.checkbox("Normalize q to max(|q|)=1", value=False)
+    normalize_q = st.checkbox("Normalize q to max(|q|)=1", value=True)
 
     st.divider()
     st.header("4) Output / metrics")
@@ -177,36 +125,29 @@ with st.sidebar:
 
     params = dict(DEFAULT_PARAMS)
     if not use_defaults:
-        for key in list(params.keys()):
-            params[key] = st.number_input(key, value=float(params[key]))
+        st.caption("For Norne, try increasing qp_amp + src_amp (2×–10×).")
+        params["qp_amp"] = st.number_input("qp_amp", value=float(params["qp_amp"]))
+        params["src_amp"] = st.number_input("src_amp", value=float(params["src_amp"]))
+        # keep others available if you want
+        with st.expander("Other parameters"):
+            for key in sorted(params.keys()):
+                if key in ("qp_amp","src_amp"):
+                    continue
+                params[key] = st.number_input(key, value=float(params[key]))
 
     st.divider()
     run_btn = st.button("Run forward prediction", type="primary")
 
-
 # -------------------------
-# Read inputs
+# Main
 # -------------------------
-npz_bytes = None
-csv_bytes = None
-
-if up_npz is not None:
-    npz_bytes = up_npz.getvalue()
-elif "_npz_bytes" in st.session_state:
-    npz_bytes = st.session_state["_npz_bytes"]
-
-if up_csv is not None:
-    csv_bytes = up_csv.getvalue()
-elif "_csv_bytes" in st.session_state:
-    csv_bytes = st.session_state["_csv_bytes"]
-
-if npz_bytes is None or csv_bytes is None:
-    st.info("Upload a phi/k NPZ and a schedule CSV (or click 'Use built-in sample inputs').")
+if up_npz is None or up_csv is None:
+    st.info("Upload a phi/k NPZ and a schedule CSV to begin.")
     st.stop()
 
 try:
-    phi, k, meta = load_npz_bytes(npz_bytes)
-    t, q = load_schedule_csv_bytes(csv_bytes)
+    phi, k, meta = load_npz(up_npz)
+    t, q = load_schedule_csv(up_csv)
 
     q = q.astype(np.float32) * np.float32(q_scale)
     if normalize_q:
@@ -218,31 +159,34 @@ except Exception as e:
     st.error(f"Failed to read inputs: {e}")
     st.stop()
 
+try:
+    phi01, k01, mask = prepare_phi_k(phi, k)
+except Exception as e:
+    st.error(f"Input fields invalid: {e}")
+    st.stop()
 
-# -------------------------
-# Preview inputs
-# -------------------------
 colA, colB = st.columns(2)
 with colA:
     st.subheader("Input: porosity (phi)")
     st.pyplot(fig_imshow(phi, f"phi | shape={phi.shape}"))
 with colB:
     st.subheader("Input: permeability (k)")
-    # show log10(k) for nicer viewing if needed
-    k_show = np.where(np.isfinite(k) & (k > 0), np.log10(k), np.nan).astype(np.float32)
-    st.pyplot(fig_imshow(k_show, f"log10(k) | shape={k.shape}"))
+    st.pyplot(fig_imshow(k, f"k | shape={k.shape}"))
 
-# compute well coordinate for display
+colC, colD = st.columns(2)
+with colC:
+    st.subheader("Prepared: phi01")
+    st.pyplot(fig_imshow(phi01, "phi01 (inactive=NaN)", vmin=0.0, vmax=1.0))
+with colD:
+    st.subheader("Prepared: k01")
+    st.pyplot(fig_imshow(k01, "k01 (inactive=NaN)", vmin=0.0, vmax=1.0))
+
 try:
-    _, k_norm, mask = prepare_phi_k(phi, k)
-    if well_mode == "manual":
-        well_ij = (int(manual_i), int(manual_j))
-    else:
-        well_ij = None
-    wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
+    user_ij = (int(manual_i), int(manual_j)) if well_mode == "manual" else None
+    wi, wj = choose_well_ij(k01, mask, well_mode, ij=user_ij)
     st.caption(f"Selected well (i,j)=({wi},{wj}) | active cells={int(mask.sum())}")
 except Exception as e:
-    st.error(f"Input fields invalid: {e}")
+    st.error(f"Well selection failed: {e}")
     st.stop()
 
 st.subheader("Injection schedule")
@@ -251,10 +195,6 @@ st.pyplot(fig_schedule(t, q, tidx=0))
 if not run_btn:
     st.stop()
 
-
-# -------------------------
-# Run model
-# -------------------------
 with st.spinner("Running VE+Darcy+Land forward model..."):
     try:
         res = run_forward(
@@ -262,15 +202,14 @@ with st.spinner("Running VE+Darcy+Land forward model..."):
             k=k,
             t=t,
             q=q,
-            params=params,
+            params=None if use_defaults else params,
             well_mode=well_mode,
-            well_ij=(int(manual_i), int(manual_j)) if well_mode == "manual" else None,
+            well_ij=user_ij,
             return_pressure=True,
             thr_area=float(thr_area),
         )
     except Exception as e:
-        st.error("Run failed. Full traceback:")
-        st.code(traceback.format_exc())
+        st.error(f"Run failed: {e}")
         st.stop()
 
 st.success("Done.")
@@ -303,7 +242,7 @@ with col3:
 st.subheader("Download results")
 out_npz = io.BytesIO()
 sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res.sg_list], axis=0).astype(np.float32)
-np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq)
+np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq, well_ij=np.array(res.well_ij))
 st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_name="sg_predicted.npz")
 
 out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
