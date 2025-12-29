@@ -1,429 +1,434 @@
+"""
+VE + Darcy + Land (forward-only) core.
+
+Self-contained (numpy only) and designed to be imported by Streamlit.
+Includes the forward paper model + small helpers for preprocessing and metrics.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
+
 import numpy as np
 
 # -------------------------
-# Parameters (add 2 scale knobs)
+# Paper defaults
 # -------------------------
-DEFAULT_PARAMS: Dict[str, float] = {
+START_PARAMS_DEFAULT = {
     "D0": 0.27802127542157334,
     "alpha_p": 0.3035718747536404,
-    "src_amp": 0.20917119946812723,
-    "prod_frac": 0.5,
-    "Swr": 0.2,
-    "Sgr_max": 0.35,
-    "C_L": 2.0,
-    "hc": 1.0,
-    "mob_exp": 1.0,
-    "anisD": 1.0,
-    "eps_h": 1e-6,
-    "nu": 0.0,
-    "m_spread": 1.0,
+    "src_amp": 289.9128164502606,
+    "prod_frac": 0.21370220515124894,
+    "Swr": 0.32291144862162,
+    "Sgr_max": 0.07441779469199929,
+    "C_L": 0.5969969351350207,
+    "eps_h": 0.08728309474730092,
+    "nu": 0.0010582605526077622,
+    "m_spread": 2.731778941305009,
+    "rad_w": 1,
     "dx": 1.0,
     "dy": 1.0,
-    # NEW (helps match paper scaling)
-    "k_vel_scale": 1.0,   # multiplies Darcy velocity
-    "p_diff_scale": 1.0,  # multiplies div(k grad p)
-    "src_sigma": 2.5,     # source width in grid cells
+
+    # NEW (capillary fringe + anisotropy)
+    "hc": 0.10,         # thickness cutoff before mobile gas appears
+    "mob_exp": 1.20,    # mapping exponent (front sharpness)
+    "anisD": 1.00,      # D_x = D0*anisD, D_y = D0/anisD
+
+    # OPTIONAL pressure model params (dimensionless calibration)
+    "ap_diff": 0.03,    # pressure diffusivity strength
+    "qp_amp": 1.0,      # pressure source amplitude
 }
+
+DEFAULT_PARAMS: Dict[str, float] = dict(START_PARAMS_DEFAULT)
+
+# -------------------------
+# Utilities for app use
+# -------------------------
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def prepare_phi_k(phi: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Prepare phi and k for the paper model.
+
+    Returns:
+        phi01 : phi normalized to [0,1] on active cells
+        k01   : log10(k) normalized to [0,1] on active cells
+        mask  : active boolean mask (finite phi & finite k & phi>0 & k>0)
+    """
+    phi = np.asarray(phi, dtype=np.float32)
+    k   = np.asarray(k, dtype=np.float32)
+
+    mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0) & (k > 0)
+    if mask.sum() < 10:
+        raise ValueError("Too few active cells in phi/k (check NPZ keys, NaNs, or units).")
+
+    p = phi.copy()
+    p[~mask] = np.nan
+    pmin = np.nanmin(p); pmax = np.nanmax(p)
+    phi01 = (p - pmin) / (pmax - pmin + 1e-12)
+    phi01 = np.clip(phi01, 0.0, 1.0).astype(np.float32)
+
+    kk = k.copy()
+    kk[~mask] = np.nan
+    logk = np.log10(np.maximum(kk, 1e-30))
+    lkmin = np.nanpercentile(logk, 1)
+    lkmax = np.nanpercentile(logk, 99)
+    logk = np.clip(logk, lkmin, lkmax)
+    k01 = (logk - lkmin) / (lkmax - lkmin + 1e-12)
+    k01 = np.clip(k01, 0.0, 1.0).astype(np.float32)
+
+    phi01[~mask] = np.nan
+    k01[~mask]   = np.nan
+    return phi01, k01, mask
+
+def choose_well_ij(k01: np.ndarray, mask: np.ndarray, mode: str = "max_k", ij: Optional[Tuple[int,int]] = None) -> Tuple[int,int]:
+    """
+    Choose well (i,j) on the active mask.
+    - max_k : choose argmax(k01) on active
+    - center: choose closest active cell to geometric center
+    - manual: use ij (validated, snapped to nearest active if needed)
+    """
+    mode = (mode or "max_k").lower()
+    nx, ny = k01.shape
+
+    if mode == "manual":
+        if ij is None:
+            raise ValueError("manual mode requires ij")
+        i, j = int(ij[0]), int(ij[1])
+        if not (0 <= i < nx and 0 <= j < ny):
+            raise ValueError("manual well (i,j) out of bounds")
+        if not bool(mask[i, j]):
+            ii, jj = np.where(mask)
+            d2 = (ii - i)**2 + (jj - j)**2
+            k = int(np.argmin(d2))
+            return int(ii[k]), int(jj[k])
+        return i, j
+
+    if mode == "max_k":
+        kk = np.where(mask, k01, -np.inf)
+        idx = int(np.nanargmax(kk))
+        i, j = np.unravel_index(idx, kk.shape)
+        return int(i), int(j)
+
+    if mode == "center":
+        ii, jj = np.where(mask)
+        ci = 0.5*(nx-1); cj = 0.5*(ny-1)
+        d2 = (ii - ci)**2 + (jj - cj)**2
+        k = int(np.argmin(d2))
+        return int(ii[k]), int(jj[k])
+
+    raise ValueError("mode must be one of: max_k, center, manual")
+
+def _area_radius(sg: np.ndarray, mask: np.ndarray, thr: float) -> Tuple[float,float]:
+    plume = np.isfinite(sg) & mask & (sg > thr)
+    area = float(plume.sum())
+    r_eq = float(np.sqrt(area / np.pi)) if area > 0 else 0.0
+    return area, r_eq
 
 @dataclass
 class ForwardResult:
     sg_list: List[np.ndarray]
     p_list: Optional[List[np.ndarray]]
+    t: np.ndarray
+    q: np.ndarray
     area: np.ndarray
     r_eq: np.ndarray
-    q: np.ndarray
-    t: np.ndarray
-    well_ij: Tuple[int, int]
-    max_sg: np.ndarray
-    max_p: np.ndarray
-
-
-# -------------------------
-# Mask-aware utilities (NO wrap, no-flow at inactive)
-# -------------------------
-def prepare_phi_k(phi: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    phi = np.array(phi, dtype=np.float32, copy=True)
-    k = np.array(k, dtype=np.float32, copy=True)
-
-    mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0) & (k > 0)
-    if mask.sum() == 0:
-        raise ValueError("No active cells found (phi/k invalid or non-positive).")
-
-    phi_clean = phi.copy()
-    phi_clean[~mask] = np.nan
-
-    # log-normalize permeability on active cells
-    k_act = k[mask]
-    klog = np.log10(np.maximum(k_act, 1e-30)).astype(np.float32)
-    kmin, kmax = float(np.min(klog)), float(np.max(klog))
-    denom = (kmax - kmin) if (kmax > kmin) else 1.0
-
-    k_norm = np.full_like(k, np.nan, dtype=np.float32)
-    k_norm[mask] = ((klog - kmin) / denom).astype(np.float32)
-
-    return phi_clean, k_norm, mask
-
-
-def choose_well_ij(
-    k_norm: np.ndarray,
-    mask: np.ndarray,
-    mode: str = "max_k",
-    ij: Optional[Tuple[int, int]] = None,
-) -> Tuple[int, int]:
-    nx, ny = k_norm.shape
-
-    if mode == "manual":
-        if ij is None:
-            raise ValueError("manual mode requires ij=(i,j)")
-        i, j = int(ij[0]), int(ij[1])
-        if not (0 <= i < nx and 0 <= j < ny):
-            raise ValueError("Manual ij out of bounds.")
-        if not bool(mask[i, j]):
-            raise ValueError("Manual ij is not an active cell.")
-        return i, j
-
-    if mode == "max_k":
-        kk = np.where(mask, k_norm, -np.inf)
-        flat = int(np.argmax(kk))
-        return tuple(map(int, np.unravel_index(flat, kk.shape)))
-
-    if mode == "center":
-        ci, cj = nx // 2, ny // 2
-        if mask[ci, cj]:
-            return int(ci), int(cj)
-        act = np.argwhere(mask)
-        d2 = (act[:, 0] - ci) ** 2 + (act[:, 1] - cj) ** 2
-        idx = int(np.argmin(d2))
-        return int(act[idx, 0]), int(act[idx, 1])
-
-    raise ValueError("mode must be one of: max_k, center, manual")
-
-
-def gaussian_source(nx: int, ny: int, wi: int, wj: int, sigma: float) -> np.ndarray:
-    ii = np.arange(nx, dtype=np.float32)[:, None]
-    jj = np.arange(ny, dtype=np.float32)[None, :]
-    d2 = (ii - wi) ** 2 + (jj - wj) ** 2
-    g = np.exp(-0.5 * d2 / (sigma * sigma)).astype(np.float32)
-    s = float(np.sum(g))
-    if s > 0:
-        g /= np.float32(s)
-    return g
-
-
-def _nbr(a: np.ndarray, di: int, dj: int) -> np.ndarray:
-    """Neighbor lookup WITHOUT wrap: out-of-bounds uses self (Neumann)."""
-    nx, ny = a.shape
-    out = a.copy()
-    ii = np.arange(nx)[:, None]
-    jj = np.arange(ny)[None, :]
-    ni = ii + di
-    nj = jj + dj
-    ok = (ni >= 0) & (ni < nx) & (nj >= 0) & (nj < ny)
-    out[ok] = a[ni[ok], nj[ok]]
-    return out
-
-
-def div_k_grad(p: np.ndarray, k: np.ndarray, mask: np.ndarray, dx: float, dy: float, anis: float) -> np.ndarray:
-    """
-    Compute divergence of flux: div( k * grad(p) )
-    - no-flow at boundaries
-    - no-flow across inactive neighbors (mask)
-    """
-    p = np.array(p, dtype=np.float32, copy=False)
-    k = np.array(k, dtype=np.float32, copy=False)
-
-    pxp = _nbr(p, +1, 0); pxm = _nbr(p, -1, 0)
-    pyp = _nbr(p, 0, +1); pym = _nbr(p, 0, -1)
-
-    kxp = _nbr(k, +1, 0); kxm = _nbr(k, -1, 0)
-    kyp = _nbr(k, 0, +1); kym = _nbr(k, 0, -1)
-
-    mxp = _nbr(mask.astype(np.float32), +1, 0) > 0.5
-    mxm = _nbr(mask.astype(np.float32), -1, 0) > 0.5
-    myp = _nbr(mask.astype(np.float32), 0, +1) > 0.5
-    mym = _nbr(mask.astype(np.float32), 0, -1) > 0.5
-
-    # face transmissibilities (average), zero if neighbor inactive
-    kfxp = 0.5 * (k + kxp) * (mask & mxp)
-    kfxm = 0.5 * (k + kxm) * (mask & mxm)
-    kfyp = 0.5 * (k + kyp) * (mask & myp)
-    kfym = 0.5 * (k + kym) * (mask & mym)
-
-    fxp = kfxp * (pxp - p) / dx
-    fxm = kfxm * (p - pxm) / dx
-    fyp = kfyp * (pyp - p) / dy
-    fym = kfym * (p - pym) / dy
-
-    divx = (fxp - fxm) / dx
-    divy = (fyp - fym) / dy
-
-    out = (divx + anis * divy).astype(np.float32)
-    out[~mask] = 0.0
-    return out
-
-
-def grad_center(p: np.ndarray, mask: np.ndarray, dx: float, dy: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Central grad with Neumann boundary; inactive treated as wall."""
-    p = np.array(p, dtype=np.float32, copy=False)
-    pxp = _nbr(p, +1, 0); pxm = _nbr(p, -1, 0)
-    pyp = _nbr(p, 0, +1); pym = _nbr(p, 0, -1)
-
-    mxp = _nbr(mask.astype(np.float32), +1, 0) > 0.5
-    mxm = _nbr(mask.astype(np.float32), -1, 0) > 0.5
-    myp = _nbr(mask.astype(np.float32), 0, +1) > 0.5
-    mym = _nbr(mask.astype(np.float32), 0, -1) > 0.5
-
-    # if neighbor inactive => use self (zero gradient)
-    pxp = np.where(mxp, pxp, p)
-    pxm = np.where(mxm, pxm, p)
-    pyp = np.where(myp, pyp, p)
-    pym = np.where(mym, pym, p)
-
-    dpx = (pxp - pxm) / (2 * dx)
-    dpy = (pyp - pym) / (2 * dy)
-
-    dpx[~mask] = 0.0
-    dpy[~mask] = 0.0
-    return dpx.astype(np.float32), dpy.astype(np.float32)
-
-
-def upwind_advect(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, mask: np.ndarray, dx: float, dy: float, dt: float) -> np.ndarray:
-    """
-    Simple upwind without wrap + walls at inactive cells.
-    """
-    h = np.array(h, dtype=np.float32, copy=False)
-
-    hxp = _nbr(h, +1, 0); hxm = _nbr(h, -1, 0)
-    hyp = _nbr(h, 0, +1); hym = _nbr(h, 0, -1)
-
-    mxp = _nbr(mask.astype(np.float32), +1, 0) > 0.5
-    mxm = _nbr(mask.astype(np.float32), -1, 0) > 0.5
-    myp = _nbr(mask.astype(np.float32), 0, +1) > 0.5
-    mym = _nbr(mask.astype(np.float32), 0, -1) > 0.5
-
-    # if upstream neighbor inactive => use self (zero gradient)
-    hxp = np.where(mxp, hxp, h)
-    hxm = np.where(mxm, hxm, h)
-    hyp = np.where(myp, hyp, h)
-    hym = np.where(mym, hym, h)
-
-    # upwind derivatives
-    dhdx = np.where(ux > 0, (h - hxm) / dx, (hxp - h) / dx)
-    dhdy = np.where(uy > 0, (h - hym) / dy, (hyp - h) / dy)
-
-    out = h - dt * (ux * dhdx + uy * dhdy)
-    out[~mask] = 0.0
-    return out.astype(np.float32)
-
-
-def laplace_masked(a: np.ndarray, mask: np.ndarray, dx: float, dy: float, anis: float) -> np.ndarray:
-    a = np.array(a, dtype=np.float32, copy=False)
-    axp = _nbr(a, +1, 0); axm = _nbr(a, -1, 0)
-    ayp = _nbr(a, 0, +1); aym = _nbr(a, 0, -1)
-
-    mxp = _nbr(mask.astype(np.float32), +1, 0) > 0.5
-    mxm = _nbr(mask.astype(np.float32), -1, 0) > 0.5
-    myp = _nbr(mask.astype(np.float32), 0, +1) > 0.5
-    mym = _nbr(mask.astype(np.float32), 0, -1) > 0.5
-
-    axp = np.where(mxp, axp, a)
-    axm = np.where(mxm, axm, a)
-    ayp = np.where(myp, ayp, a)
-    aym = np.where(mym, aym, a)
-
-    d2x = (axp - 2 * a + axm) / (dx * dx)
-    d2y = (ayp - 2 * a + aym) / (dy * dy)
-    out = (d2x + anis * d2y).astype(np.float32)
-    out[~mask] = 0.0
-    return out
-
-
-# -------------------------
-# Physics blocks
-# -------------------------
-def simulate_pressure(k_norm: np.ndarray, mask: np.ndarray, well_ij: Tuple[int, int], q: np.ndarray, params: Dict[str, float]) -> List[np.ndarray]:
-    nx, ny = k_norm.shape
-    wi, wj = well_ij
-
-    alpha_p = float(params["alpha_p"])
-    anisD = float(params["anisD"])
-    dx = float(params["dx"]); dy = float(params["dy"])
-    p_diff_scale = float(params.get("p_diff_scale", 1.0))
-    qp_amp = float(params.get("qp_amp", 1.0))
-    sigma = float(params.get("src_sigma", 2.5))
-
-    src = gaussian_source(nx, ny, wi, wj, sigma=sigma).astype(np.float32)
-    src = np.where(mask, src, 0.0).astype(np.float32)
-
-    p = np.zeros((nx, ny), dtype=np.float32)
-    out: List[np.ndarray] = []
-
-    for tt in range(len(q)):
-        out.append(np.where(mask, p, np.nan).astype(np.float32))
-        p = p + alpha_p * p_diff_scale * div_k_grad(p, np.where(mask, k_norm, 0.0), mask, dx, dy, anisD) \
-              + (qp_amp * float(q[tt])) * src
-        p[~mask] = 0.0
-
-    return out
-
-
-def thickness_to_mobile_sg(h: np.ndarray, hc: float, mob_exp: float) -> np.ndarray:
-    h = np.maximum(h, 0.0).astype(np.float32)
-    x = h / float(hc + 1e-12)
-    sg = 1.0 - np.exp(-np.power(x, float(mob_exp)))
-    return np.clip(sg, 0.0, 1.0).astype(np.float32)
-
-
-def land_residual_from_max(Sg_max: np.ndarray, C_L: float, Sgr_max: float) -> np.ndarray:
-    Sgr = (C_L * Sg_max) / (1.0 + C_L * Sg_max)
-    return np.minimum(Sgr, Sgr_max).astype(np.float32)
-
-
-def simulate_sg(p_list: List[np.ndarray], k_norm: np.ndarray, mask: np.ndarray, well_ij: Tuple[int, int], q: np.ndarray, params: Dict[str, float]) -> List[np.ndarray]:
-    nx, ny = k_norm.shape
-    wi, wj = well_ij
-
-    D0 = float(params["D0"])
-    src_amp = float(params["src_amp"])
-    prod_frac = float(params["prod_frac"])
-    hc = float(params["hc"])
-    mob_exp = float(params["mob_exp"])
-    C_L = float(params["C_L"])
-    Sgr_max = float(params["Sgr_max"])
-    anisD = float(params["anisD"])
-    eps_h = float(params["eps_h"])
-    m_spread = float(params["m_spread"])
-    dx = float(params["dx"]); dy = float(params["dy"])
-    nu = float(params["nu"])
-    k_vel_scale = float(params.get("k_vel_scale", 1.0))
-    sigma = float(params.get("src_sigma", 2.5))
-
-    src = gaussian_source(nx, ny, wi, wj, sigma=sigma).astype(np.float32)
-    src = np.where(mask, src, 0.0).astype(np.float32)
-
-    h = np.zeros((nx, ny), dtype=np.float32)
-    sg_max = np.zeros((nx, ny), dtype=np.float32)
-    out: List[np.ndarray] = []
-
-   dt_outer = 1.0
-
-for tt in range(len(q)):
-    p = np.where(np.isfinite(p_list[tt]), p_list[tt], 0.0).astype(np.float32)
-
-    dpx, dpy = grad_center(p, mask, dx, dy)
-    ux = -k_vel_scale * (k_eff * dpx)
-    uy = -k_vel_scale * (k_eff * dpy)
-
-    if nu != 0.0:
-        ux = ux / (1.0 + nu * np.abs(ux))
-        uy = uy / (1.0 + nu * np.abs(uy))
-
-    # ---- stability / CFL ----
-    umax = float(np.nanmax(np.abs(ux[mask]))) if mask.any() else 0.0
-    vmax = float(np.nanmax(np.abs(uy[mask]))) if mask.any() else 0.0
-    max_u = max(umax, vmax)
-
-    # effective diffusion strength (very conservative but stable)
-    kmax = float(np.nanmax(k_eff[mask])) if mask.any() else 0.0
-    D_eff = float(D0 + abs(m_spread) * kmax)  # conservative
-
-    dt_adv  = 0.45 * min(dx, dy) / (max_u + 1e-8)            # advection CFL
-    dt_diff = 0.20 * min(dx*dx, dy*dy) / (D_eff + 1e-12)     # explicit diffusion stability
-
-    dt_sub = min(dt_outer, dt_adv, dt_diff)
-    nsub = int(np.ceil(dt_outer / dt_sub))
-    nsub = max(1, nsub)
-    dt = dt_outer / nsub
-
-    qt = float(q[tt])
-    inj = max(qt, 0.0)
-    prod = -min(qt, 0.0)
-
-    for _ in range(nsub):
-        h_adv = upwind_advect(h, ux, uy, mask, dx, dy, dt)
-
-        h_diff = D0 * laplace_masked(h_adv, mask, dx, dy, anisD)
-
-        # your spread term (kept), but now stable due to substeps
-        h_spread = m_spread * laplace_masked(k_eff * h_adv, mask, dx, dy, anisD)
-
-        # sources scaled by dt
-        h_new = h_adv + dt * (
-            h_diff
-            + h_spread
-            + (src_amp * inj) * src
-            - (prod_frac * prod) * src
-        )
-
-        h = np.where(mask, np.maximum(h_new, 0.0), 0.0).astype(np.float32)
-
-    # convert thickness -> Sg and apply Land residual
-    sg_m = thickness_to_mobile_sg(h + eps_h, hc=hc, mob_exp=mob_exp)
-    sg_max = np.maximum(sg_max, sg_m)
-    sg_r = land_residual_from_max(sg_max, C_L=C_L, Sgr_max=Sgr_max)
-    sg_tot = np.maximum(sg_m, sg_r)
-
-    out.append(np.where(mask, sg_tot, np.nan).astype(np.float32))
-
-
-    return out
-
+    well_ij: Tuple[int,int]
+    mask: np.ndarray
+    params: Dict[str,float]
 
 def run_forward(
     phi: np.ndarray,
     k: np.ndarray,
     t: np.ndarray,
     q: np.ndarray,
-    params: Optional[Dict[str, float]] = None,
+    params: Optional[Dict[str,float]] = None,
     well_mode: str = "max_k",
-    well_ij: Optional[Tuple[int, int]] = None,
+    well_ij: Optional[Tuple[int,int]] = None,
     return_pressure: bool = True,
     thr_area: float = 0.05,
 ) -> ForwardResult:
-    if params is None:
-        params = dict(DEFAULT_PARAMS)
-    else:
-        tmp = dict(DEFAULT_PARAMS)
-        tmp.update(params)
-        params = tmp
+    """
+    Run the VE+Darcy+Land paper model forward without observations.
+    """
+    t = np.asarray(t, dtype=np.float32).reshape(-1)
+    q = np.asarray(q, dtype=np.float32).reshape(-1)
+    if t.size != q.size:
+        raise ValueError(f"Schedule mismatch: len(t)={t.size} but len(q)={q.size}")
 
-    t = np.array(t, dtype=np.float32)
-    q = np.array(q, dtype=np.float32)
-    if len(t) != len(q):
-        raise ValueError(f"t and q must have same length. Got len(t)={len(t)} len(q)={len(q)}")
+    phi01, k01, mask = prepare_phi_k(phi, k)
+    wi, wj = choose_well_ij(k01, mask, mode=well_mode, ij=well_ij)
 
-    _, k_norm, mask = prepare_phi_k(phi, k)
+    p0 = np.zeros_like(phi01, dtype=np.float32)
 
-    if well_mode == "manual":
-        if well_ij is None:
-            raise ValueError("manual well_mode requires well_ij=(i,j)")
-        wi, wj = choose_well_ij(k_norm, mask, "manual", ij=well_ij)
-    else:
-        wi, wj = choose_well_ij(k_norm, mask, well_mode)
+    pp = dict(DEFAULT_PARAMS)
+    if params:
+        # merge, coercing to float
+        for key, val in params.items():
+            if key in pp:
+                pp[key] = _safe_float(val, pp[key])
 
-    p_list = simulate_pressure(k_norm, mask, (wi, wj), q, params)
+    # no-observation pressure list
+    p_obs_list = [np.zeros_like(p0, dtype=np.float32) for _ in range(int(t.size))]
 
-    sg_list = simulate_sg(p_list, k_norm, mask, (wi, wj), q, params)
+    sg_list, p_list = simulate_ve(
+        phi=phi01,
+        k=k01,
+        p0=p0,
+        q=q,
+        well_ij=(wi, wj),
+        params=pp,
+        p_obs_list=p_obs_list,
+        return_pressure=bool(return_pressure),
+    )
 
-    area = np.array([float(np.nansum(s > thr_area)) for s in sg_list], dtype=np.float32)
-    r_eq = np.sqrt(area / np.pi).astype(np.float32)
-
-    max_sg = np.array([float(np.nanmax(s)) if np.isfinite(s).any() else 0.0 for s in sg_list], dtype=np.float32)
-    max_p = np.array([float(np.nanmax(p)) if np.isfinite(p).any() else 0.0 for p in p_list], dtype=np.float32)
+    area = np.zeros((t.size,), dtype=np.float32)
+    r_eq = np.zeros((t.size,), dtype=np.float32)
+    for n in range(int(t.size)):
+        a, r = _area_radius(sg_list[n], mask, float(thr_area))
+        area[n] = a
+        r_eq[n] = r
 
     return ForwardResult(
         sg_list=sg_list,
-        p_list=p_list if return_pressure else None,
+        p_list=p_list,
+        t=t,
+        q=q,
         area=area,
         r_eq=r_eq,
-        q=q,
-        t=t,
         well_ij=(wi, wj),
-        max_sg=max_sg,
-        max_p=max_p,
+        mask=mask,
+        params=pp,
     )
 
+# -------------------------
+# Paper model implementation (copied from your paper script)
+# -------------------------
+def geom_mean(a: np.ndarray, eps=1e-30) -> float:
+    a = np.asarray(a, dtype=float)
+    a = np.clip(a, eps, None)
+    return float(np.exp(np.mean(np.log(a))))
+
+def central_grad(a: np.ndarray, dx=1.0, dy=1.0):
+    ap = np.pad(a, ((1,1),(1,1)), mode="edge")
+    dax = (ap[1:-1, 2:] - ap[1:-1, :-2]) * (0.5 / dx)
+    day = (ap[2:, 1:-1] - ap[:-2, 1:-1]) * (0.5 / dy)
+    return dax, day
+
+def laplacian(a: np.ndarray):
+    ap = np.pad(a, ((1,1),(1,1)), mode="edge")
+    return (ap[1:-1, 2:] + ap[1:-1, :-2] + ap[2:, 1:-1] + ap[:-2, 1:-1] - 4.0*ap[1:-1, 1:-1])
+
+def upwind_advect(h: np.ndarray, ux: np.ndarray, uy: np.ndarray, dt: float):
+    hp = np.pad(h, ((1,1),(1,1)), mode="edge")
+    hx_f = hp[1:-1, 2:] - hp[1:-1, 1:-1]
+    hx_b = hp[1:-1, 1:-1] - hp[1:-1, :-2]
+    hy_f = hp[2:, 1:-1] - hp[1:-1, 1:-1]
+    hy_b = hp[1:-1, 1:-1] - hp[:-2, 1:-1]
+    dhdx = np.where(ux >= 0, hx_b, hx_f)
+    dhdy = np.where(uy >= 0, hy_b, hy_f)
+    return h - dt * (ux*dhdx + uy*dhdy)
+
+def k_spreading_power_aniso(h: np.ndarray, k_norm: np.ndarray, D0x: float, D0y: float, eps_h: float, m_spread: float, dt: float):
+    """
+    ∂h/∂t = ∂/∂x( D0x*k*(h+eps)^m * ∂h/∂x ) + ∂/∂y( D0y*k*(h+eps)^m * ∂h/∂y )
+    """
+    hp = np.pad(h, ((1,1),(1,1)), mode="edge")
+    kp = np.pad(k_norm, ((1,1),(1,1)), mode="edge")
+
+    h_c = hp[1:-1, 1:-1]
+    h_e = hp[1:-1, 2:]
+    h_w = hp[1:-1, :-2]
+    h_n = hp[:-2, 1:-1]
+    h_s = hp[2:, 1:-1]
+
+    k_c = kp[1:-1, 1:-1]
+    k_e = kp[1:-1, 2:]
+    k_w = kp[1:-1, :-2]
+    k_n = kp[:-2, 1:-1]
+    k_s = kp[2:, 1:-1]
+
+    def havg(a, b):
+        return 2*a*b/(a+b+1e-12)
+
+    ke = havg(k_c, k_e)
+    kw = havg(k_c, k_w)
+    kn = havg(k_c, k_n)
+    ks = havg(k_c, k_s)
+
+    he = 0.5*(h_c + h_e)
+    hw = 0.5*(h_c + h_w)
+    hn = 0.5*(h_c + h_n)
+    hs = 0.5*(h_c + h_s)
+
+    Ce = D0x * ke * np.power(np.maximum(he + eps_h, 0.0), m_spread)
+    Cw = D0x * kw * np.power(np.maximum(hw + eps_h, 0.0), m_spread)
+    Cn = D0y * kn * np.power(np.maximum(hn + eps_h, 0.0), m_spread)
+    Cs = D0y * ks * np.power(np.maximum(hs + eps_h, 0.0), m_spread)
+
+    Fe = Ce * (h_e - h_c)
+    Fw = Cw * (h_c - h_w)
+    Fn = Cn * (h_c - h_n)
+    Fs = Cs * (h_s - h_c)
+
+    divF = (Fe - Fw) + (Fs - Fn)
+    return h + dt * divF
+
+def ve_mobile_sg_from_h(h: np.ndarray, Swr: float, hc: float, mob_exp: float):
+    """
+    Capillary/fringe mapping:
+      effective thickness = clip((h - hc)/(1-hc), 0, 1)
+      Sg_mob = (1-Swr) * eff^mob_exp
+    """
+    hc = float(np.clip(hc, 0.0, 0.9))
+    eff = np.clip((h - hc) / (1.0 - hc + 1e-12), 0.0, 1.0)
+    eff = np.power(eff, max(0.25, float(mob_exp)))
+    return (1.0 - Swr) * eff
+
+def land_residual(Sg_max: np.ndarray, Sgr_max: float, C_L: float):
+    return Sgr_max * (Sg_max / (Sg_max + C_L + 1e-12))
+
+def plume_mask(sg, thr):
+    return sg > thr
+
+def infer_q_sign_and_weight(p_list, wi, wj):
+    pw = np.array([p[wi, wj] for p in p_list], dtype=float)
+    dp = np.diff(pw, prepend=pw[0])
+
+    dead = np.std(dp) * 0.25 + 1e-6
+    sign = np.where(dp > dead,  1.0, np.where(dp < -dead, -1.0, 0.0))
+
+    dp_pos = np.clip(dp, 0.0, None)
+    dp_neg = np.clip(-dp, 0.0, None)
+
+    pos_ref = np.mean(dp_pos[dp_pos > dead]) if np.any(dp_pos > dead) else 1.0
+    neg_ref = np.mean(dp_neg[dp_neg > dead]) if np.any(dp_neg > dead) else 1.0
+
+    w = np.where(sign > 0, dp_pos / (pos_ref + 1e-12),
+                 np.where(sign < 0, dp_neg / (neg_ref + 1e-12), 0.0))
+    w = np.clip(w, 0.0, 3.0)
+    return sign.astype(np.float32), w.astype(np.float32)
+
+def apply_well_source_sink(h, q_sign, q_w, src_amp, prod_frac, wi, wj, rad_w, dt):
+    h2 = h.copy()
+    i0, i1 = max(0, wi-rad_w), min(h.shape[0], wi+rad_w+1)
+    j0, j1 = max(0, wj-rad_w), min(h.shape[1], wj+rad_w+1)
+    n = (i1-i0)*(j1-j0)
+    if q_sign > 0:
+        h2[i0:i1, j0:j1] += (src_amp * q_w * dt) / max(1, n)
+    elif q_sign < 0:
+        h2[i0:i1, j0:j1] -= (prod_frac * src_amp * q_w * dt) / max(1, n)
+    return h2
+
+def simulate_pressure(p_obs_list, k_norm, well_ij, q_sign, q_w, ap_diff, qp_amp, dx, dy):
+    """
+    Simple variable-coefficient pressure diffusion for Δp:
+      ∂p/∂t = ap_diff * ∇·(k_norm ∇p) + qp_amp*q(t)*I_well
+    """
+    wi, wj = well_ij
+    Nt = len(p_obs_list)
+    p = p_obs_list[0].copy().astype(np.float32)
+    p0 = p.copy()
+    out = []
+
+    # stability
+    maxk = float(np.max(k_norm))
+    dt_stable = 0.18 * (min(dx, dy)**2) / (ap_diff * maxk + 1e-12)
+    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 60))
+    dt = 1.0 / nsub
+
+    rad = 1
+    for t in range(Nt):
+        for _ in range(nsub):
+            gx, gy = central_grad(p, dx=dx, dy=dy)
+            # flux = k * grad(p)
+            fx = (k_norm * gx).astype(np.float32)
+            fy = (k_norm * gy).astype(np.float32)
+            # div(k grad p) ~ laplacian(p) weighted approx
+            div = laplacian(p)  # cheap fallback
+            p = p + (ap_diff * dt) * (k_norm * div)
+
+            # source term (sign + magnitude)
+            if q_sign[t] != 0.0:
+                i0, i1 = max(0, wi-rad), min(p.shape[0], wi+rad+1)
+                j0, j1 = max(0, wj-rad), min(p.shape[1], wj+rad+1)
+                n = (i1-i0)*(j1-j0)
+                p[i0:i1, j0:j1] += (qp_amp * q_sign[t] * q_w[t] * dt) / max(1, n)
+
+        out.append(p.copy())
+
+    # shift baseline to match p0 exactly at t=0
+    out[0] = p0
+    return out
+
+def simulate_ve(p_obs_list, k_norm, well_ij, params, fit_pressure=False, use_pred_p_for_vel=False):
+    wi, wj = well_ij
+    Nt = len(p_obs_list)
+    dx = float(params.get("dx", DX_DEFAULT))
+    dy = float(params.get("dy", DY_DEFAULT))
+
+    D0        = float(params["D0"])
+    alpha_p   = float(params["alpha_p"])
+    src_amp   = float(params["src_amp"])
+    prod_frac = float(params["prod_frac"])
+    Swr       = float(params["Swr"])
+    Sgr_max   = float(params["Sgr_max"])
+    C_L       = float(params["C_L"])
+    eps_h     = float(params["eps_h"])
+    nu        = float(params["nu"])
+    m_spread  = float(params["m_spread"])
+    rad_w     = int(params["rad_w"])
+    hc        = float(params.get("hc", 0.0))
+    mob_exp   = float(params.get("mob_exp", 1.0))
+    anisD     = float(params.get("anisD", 1.0))
+
+    q_sign, q_w = infer_q_sign_and_weight(p_obs_list, wi, wj)
+
+    # optional predicted pressure
+    p_pred_list = None
+    if fit_pressure or use_pred_p_for_vel:
+        ap_diff = float(params.get("ap_diff", 0.03))
+        qp_amp  = float(params.get("qp_amp", 1.0))
+        p_pred_list = simulate_pressure(p_obs_list, k_norm, well_ij, q_sign, q_w, ap_diff, qp_amp, dx, dy)
+
+    # substepping for VE stability
+    maxk = float(np.max(k_norm))
+    D0x = D0 * anisD
+    D0y = D0 / (anisD + 1e-12)
+    coefmax = (max(D0x, D0y) * maxk * (1.0 + eps_h)**max(1.0, m_spread) + nu)
+    dt_stable = 0.18 * (min(dx, dy)**2) / (coefmax + 1e-12)
+    nsub = int(np.clip(np.ceil(1.0 / max(dt_stable, 1e-6)), 1, 40))
+    dt = 1.0 / nsub
+
+    h = np.zeros_like(p_obs_list[0], dtype=np.float32)
+    Sg_max_hist = np.zeros_like(h, dtype=np.float32)
+
+    sg_pred = []
+
+    for t in range(Nt):
+        p_field = p_pred_list[t] if (use_pred_p_for_vel and p_pred_list is not None) else p_obs_list[t]
+        gx, gy = central_grad(p_field, dx=dx, dy=dy)
+        ux = (-alpha_p * k_norm * gx).astype(np.float32)
+        uy = (-alpha_p * k_norm * gy).astype(np.float32)
+
+        for _ in range(nsub):
+            h = upwind_advect(h, ux, uy, dt=dt)
+            h = k_spreading_power_aniso(h, k_norm, D0x=D0x, D0y=D0y, eps_h=eps_h, m_spread=m_spread, dt=dt)
+            h = h + (nu * dt) * laplacian(h)
+            h = apply_well_source_sink(h, q_sign[t], q_w[t], src_amp, prod_frac, wi, wj, rad_w, dt=dt)
+            h = np.clip(h, 0.0, 1.0).astype(np.float32)
+
+        sg_mob = ve_mobile_sg_from_h(h, Swr=Swr, hc=hc, mob_exp=mob_exp).astype(np.float32)
+        Sg_max_hist = np.maximum(Sg_max_hist, sg_mob)
+        sg_res = land_residual(Sg_max_hist, Sgr_max=Sgr_max, C_L=C_L).astype(np.float32)
+        sg_tot = np.maximum(sg_mob, sg_res)
+        sg_tot = np.clip(sg_tot, 0.0, 1.0).astype(np.float32)
+
+        sg_pred.append(sg_tot)
+
+    return sg_pred, p_pred_list
