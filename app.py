@@ -1,358 +1,321 @@
-# app.py
-import io
+# ve_core.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
-
-from ve_core import DEFAULT_PARAMS, run_forward, choose_well_ij, prepare_phi_k
-
-st.set_page_config(page_title="VE Forward Predictor (Diverse Data)", layout="wide")
-st.title("VE + Darcy + Land (robust input): Forward plume predictor")
 
 
-st.markdown(
+# -----------------------------
+# Parameters (paper-style knobs)
+# -----------------------------
+DEFAULT_PARAMS: Dict[str, float] = {
+    # Diffusion / spread
+    "D0": 0.20,          # base diffusion strength
+    "anisD": 1.0,        # anisotropy multiplier (>=1 stretches along x)
+    "mob_exp": 1.0,      # mobility exponent on k_norm (>=0)
+
+    # Pressure & Darcy-like advection
+    "alpha_p": 1.0,      # pressure amplitude scale (relative)
+    "ap_diff": 0.7,      # pressure Gaussian width factor (bigger = smoother)
+    "nu": 0.35,          # advection strength (Darcy drift multiplier)
+
+    # Source / sink distribution
+    "src_sigma": 2.0,    # source Gaussian sigma (cells)
+    "prod_sigma": 3.0,   # production sink sigma (cells)
+    "prod_frac": 0.85,   # production removes from mobile sg
+
+    # Land trapping (residual)
+    "Swr": 0.15,
+    "Sgr_max": 0.35,
+    "C_L": 0.25,         # Land coefficient: Sgr ~ min(Sgr_max, C_L * max_sg)
+
+    # Numerical stability / smoothing
+    "dt": 0.35,          # stable timestep factor (0.1..0.6 typical)
+    "blur_steps": 1,     # extra smoothing steps per timestep (0..2)
+    "clip_eps": 1e-6,    # to avoid negative/NaN creep
+}
+
+
+# -----------------------------
+# Result container
+# -----------------------------
+@dataclass
+class ForwardResult:
+    t: np.ndarray
+    q: np.ndarray
+    sg_list: List[np.ndarray]
+    p_list: Optional[List[np.ndarray]]
+    area: np.ndarray
+    r_eq: np.ndarray
+    well_ij: Tuple[int, int]
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def prepare_phi_k(phi: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return phi_norm, k_norm, mask(active). Keeps NaN outside active."""
+    phi = np.asarray(phi, dtype=np.float32)
+    k = np.asarray(k, dtype=np.float32)
+    if phi.ndim != 2 or k.ndim != 2:
+        raise ValueError("phi and k must be 2D arrays.")
+    if phi.shape != k.shape:
+        raise ValueError(f"phi and k must have the same shape. Got {phi.shape} vs {k.shape}.")
+
+    mask = np.isfinite(phi) & np.isfinite(k) & (phi > 0) & (k > 0)
+    if mask.sum() < 10:
+        raise ValueError("Too few active cells after masking. Check phi/k inputs.")
+
+    # Normalize for stable numerics (log k is common, but keep simple)
+    phi_act = phi[mask]
+    k_act = k[mask]
+
+    phi_norm = np.full_like(phi, np.nan, dtype=np.float32)
+    k_norm = np.full_like(k, np.nan, dtype=np.float32)
+
+    phi_norm[mask] = (phi_act - np.percentile(phi_act, 5)) / (np.percentile(phi_act, 95) - np.percentile(phi_act, 5) + 1e-12)
+    phi_norm[mask] = np.clip(phi_norm[mask], 0.0, 1.0)
+
+    lk = np.log10(k_act)
+    lk_norm = (lk - np.percentile(lk, 5)) / (np.percentile(lk, 95) - np.percentile(lk, 5) + 1e-12)
+    lk_norm = np.clip(lk_norm, 0.0, 1.0)
+
+    k_norm[mask] = lk_norm.astype(np.float32)
+    return phi_norm, k_norm, mask
+
+
+def choose_well_ij(k_norm: np.ndarray, mask: np.ndarray, mode: str, ij: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+    """Pick well location in active region."""
+    nx, ny = k_norm.shape
+    if mode == "manual":
+        if ij is None:
+            raise ValueError("manual mode requires ij=(i,j)")
+        i, j = int(ij[0]), int(ij[1])
+        i = int(np.clip(i, 0, nx - 1))
+        j = int(np.clip(j, 0, ny - 1))
+        if not mask[i, j]:
+            # move to nearest active by brute force
+            ii, jj = np.where(mask)
+            d = (ii - i) ** 2 + (jj - j) ** 2
+            k = int(np.argmin(d))
+            return int(ii[k]), int(jj[k])
+        return i, j
+
+    if mode == "center":
+        ii, jj = np.where(mask)
+        return int(np.median(ii)), int(np.median(jj))
+
+    if mode == "max_k":
+        tmp = np.where(mask, k_norm, -np.inf)
+        idx = np.unravel_index(int(np.argmax(tmp)), tmp.shape)
+        return int(idx[0]), int(idx[1])
+
+    raise ValueError("well mode must be one of: max_k, center, manual")
+
+
+def _gauss2d(nx: int, ny: int, cx: int, cy: int, sigma: float) -> np.ndarray:
+    x = np.arange(nx)[:, None]
+    y = np.arange(ny)[None, :]
+    r2 = (x - cx) ** 2 + (y - cy) ** 2
+    g = np.exp(-0.5 * r2 / (sigma ** 2 + 1e-12)).astype(np.float32)
+    s = float(g.sum())
+    return g / (s + 1e-12)
+
+
+def _grad2d(a: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Central differences (with edge replication)."""
+    ax = np.empty_like(a, dtype=np.float32)
+    ay = np.empty_like(a, dtype=np.float32)
+
+    ax[1:-1, :] = 0.5 * (a[2:, :] - a[:-2, :])
+    ax[0, :] = a[1, :] - a[0, :]
+    ax[-1, :] = a[-1, :] - a[-2, :]
+
+    ay[:, 1:-1] = 0.5 * (a[:, 2:] - a[:, :-2])
+    ay[:, 0] = a[:, 1] - a[:, 0]
+    ay[:, -1] = a[:, -1] - a[:, -2]
+    return ax, ay
+
+
+def _div2d(fx: np.ndarray, fy: np.ndarray) -> np.ndarray:
+    """Divergence of (fx, fy) using backward differences."""
+    out = np.zeros_like(fx, dtype=np.float32)
+    out[1:, :] += fx[1:, :] - fx[:-1, :]
+    out[:, 1:] += fy[:, 1:] - fy[:, :-1]
+    return out
+
+
+def _blur2d(a: np.ndarray, mask: np.ndarray, steps: int = 1) -> np.ndarray:
+    """Small separable blur to remove checkerboard without scipy."""
+    if steps <= 0:
+        return a
+    kernel = np.array([1, 4, 6, 4, 1], dtype=np.float32)
+    kernel = kernel / kernel.sum()
+
+    out = a.copy().astype(np.float32)
+    for _ in range(steps):
+        # blur x
+        tmp = out.copy()
+        for dx in range(-2, 3):
+            w = kernel[dx + 2]
+            tmp += w * np.roll(out, shift=dx, axis=0)
+        out = tmp / (1.0 + 1.0)  # keep amplitude controlled
+
+        # blur y
+        tmp = out.copy()
+        for dy in range(-2, 3):
+            w = kernel[dy + 2]
+            tmp += w * np.roll(out, shift=dy, axis=1)
+        out = tmp / (1.0 + 1.0)
+
+        # enforce mask
+        out = np.where(mask, out, 0.0).astype(np.float32)
+
+    return out
+
+
+# -----------------------------
+# Forward model
+# -----------------------------
+def run_forward(
+    phi: np.ndarray,
+    k: np.ndarray,
+    t: np.ndarray,
+    q: np.ndarray,
+    params: Dict[str, float],
+    well_mode: str = "max_k",
+    well_ij: Optional[Tuple[int, int]] = None,
+    return_pressure: bool = True,
+    thr_area: float = 0.05,
+) -> ForwardResult:
     """
-This version supports **diverse data**:
+    Smooth VE+Darcy+Land-like surrogate:
+    - Source proportional to q(t) injected at well (Gaussian)
+    - Pressure surrogate: Gaussian potential -> Darcy drift (advection)
+    - Heterogeneous diffusion scaled by k_norm
+    - Land trapping via residual Sgr depending on max saturation history
+    """
+    params = {**DEFAULT_PARAMS, **(params or {})}
 
-### NPZ
-- Keys can be: `phi/k`, `poro/permx`, `PORO/PERMX`, `porosity/permeability`, etc.
-- Arrays can be **2D** or **3D** (choose layer / mean / max).
-
-Optional keys:
-- `actnum` / `ACTNUM` mask
-- `dx`, `dy` (cell size) to get radius/area in physical units
-
-### Schedule CSV
-Accepts either:
-1) **Per-step**: columns `t`, `q`
-2) **Segments**: columns `t_start`, `t_end`, `q` (auto-expanded & resampled)
-
-You can also **resample to uniform dt** (recommended for smooth results).
-"""
-)
-
-# -------------------------
-# Helpers (diverse NPZ)
-# -------------------------
-PHI_KEYS = ["phi", "poro", "porosity", "PORO"]
-K_KEYS = ["k", "permx", "perm", "permeability", "PERMX"]
-ACT_KEYS = ["actnum", "ACTNUM", "mask", "MASK"]
-DX_KEYS = ["dx", "DX"]
-DY_KEYS = ["dy", "DY"]
-
-
-def _find_key(data, candidates):
-    for k in candidates:
-        if k in data.files:
-            return k
-    # try case-insensitive
-    lower_map = {kk.lower(): kk for kk in data.files}
-    for k in candidates:
-        if k.lower() in lower_map:
-            return lower_map[k.lower()]
-    return None
-
-
-def load_npz_diverse(uploaded, mode_3d="layer", layer=0):
-    data = np.load(uploaded, allow_pickle=True)
-
-    kphi = _find_key(data, PHI_KEYS)
-    kk = _find_key(data, K_KEYS)
-    if kphi is None or kk is None:
-        raise ValueError(f"NPZ must contain porosity + permeability keys. Found keys: {list(data.files)}")
-
-    phi = np.array(data[kphi])
-    perm = np.array(data[kk])
-
-    # optional mask
-    km = _find_key(data, ACT_KEYS)
-    mask = None
-    if km is not None:
-        m = np.array(data[km])
-        mask = (m > 0)
-
-    # optional dx/dy
-    dx = float(data[_find_key(data, DX_KEYS)]) if _find_key(data, DX_KEYS) else 1.0
-    dy = float(data[_find_key(data, DY_KEYS)]) if _find_key(data, DY_KEYS) else 1.0
-
-    # handle 3D -> 2D
-    def to2d(a):
-        if a.ndim == 2:
-            return a
-        if a.ndim != 3:
-            raise ValueError(f"Array must be 2D or 3D, got shape={a.shape}")
-        if mode_3d == "layer":
-            k = int(np.clip(layer, 0, a.shape[0] - 1))
-            return a[k, :, :]
-        if mode_3d == "mean":
-            return np.nanmean(a, axis=0)
-        if mode_3d == "max":
-            return np.nanmax(a, axis=0)
-        raise ValueError("mode_3d must be layer/mean/max")
-
-    phi2 = to2d(phi).astype(np.float32)
-    k2 = to2d(perm).astype(np.float32)
-
-    mask2 = None
-    if mask is not None:
-        mask2 = to2d(mask).astype(bool)
-
-    meta = {"phi_key": kphi, "k_key": kk, "dx": dx, "dy": dy, "orig_phi_shape": tuple(phi.shape), "orig_k_shape": tuple(perm.shape)}
-    return phi2, k2, mask2, meta
-
-
-# -------------------------
-# Helpers (diverse schedule)
-# -------------------------
-def load_schedule_diverse(uploaded):
-    df = pd.read_csv(uploaded)
-    df.columns = [c.lower().strip() for c in df.columns]
-
-    if ("t" in df.columns) and ("q" in df.columns):
-        t = df["t"].to_numpy(dtype=np.float32)
-        q = df["q"].to_numpy(dtype=np.float32)
-        return t, q
-
-    # segment format
-    need = {"t_start", "t_end", "q"}
-    if need.issubset(set(df.columns)):
-        seg = df[["t_start", "t_end", "q"]].copy()
-        seg["t_start"] = seg["t_start"].astype(np.float32)
-        seg["t_end"] = seg["t_end"].astype(np.float32)
-        seg["q"] = seg["q"].astype(np.float32)
-        return seg, None
-
-    raise ValueError("Schedule CSV must have either (t,q) OR (t_start,t_end,q).")
-
-
-def expand_segments_to_steps(seg_df, dt=1.0):
-    tmin = float(seg_df["t_start"].min())
-    tmax = float(seg_df["t_end"].max())
-    t = np.arange(tmin, tmax + 1e-6, dt, dtype=np.float32)
-    q = np.zeros_like(t, dtype=np.float32)
-
-    for _, r in seg_df.iterrows():
-        m = (t >= float(r["t_start"])) & (t < float(r["t_end"]))
-        q[m] = float(r["q"])
-    return t, q
-
-
-def resample_steps(t, q, dt=1.0):
-    t = np.asarray(t, dtype=np.float32)
-    q = np.asarray(q, dtype=np.float32)
-
-    t0, t1 = float(t.min()), float(t.max())
-    tg = np.arange(t0, t1 + 1e-6, dt, dtype=np.float32)
-    # piecewise constant hold-last
-    qg = np.interp(tg, t, q, left=q[0], right=q[-1]).astype(np.float32)
-    return tg, qg
-
-
-def fig_imshow(arr, title, vmin=None, vmax=None):
-    fig = plt.figure(figsize=(7.2, 4.6))
-    plt.title(title)
-    if vmin is None: vmin = float(np.nanmin(arr))
-    if vmax is None: vmax = float(np.nanmax(arr))
-    im = plt.imshow(arr, origin="lower", vmin=vmin, vmax=vmax)
-    plt.xlabel("j")
-    plt.ylabel("i")
-    plt.colorbar(im, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    return fig
-
-
-def fig_schedule(t, q, tidx=None):
-    fig = plt.figure(figsize=(7.2, 4.6))
-    plt.title("Schedule q(t)")
-    plt.plot(t, q)
-    if tidx is not None and 0 <= tidx < len(t):
-        plt.axvline(t[tidx], linestyle="--")
-    plt.xlabel("t")
-    plt.ylabel("q")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    return fig
-
-
-def fig_timeseries(t, y, ylab, title):
-    fig = plt.figure(figsize=(7.2, 4.6))
-    plt.title(title)
-    plt.plot(t, y)
-    plt.xlabel("t")
-    plt.ylabel(ylab)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    return fig
-
-
-# -------------------------
-# Sidebar
-# -------------------------
-with st.sidebar:
-    st.header("1) Upload")
-    up_npz = st.file_uploader("phi/k NPZ (2D or 3D)", type=["npz"])
-    up_csv = st.file_uploader("schedule CSV", type=["csv"])
-
-    st.divider()
-    st.header("2) 3D handling (if NPZ is 3D)")
-    mode_3d = st.selectbox("3D -> 2D reduction", ["layer", "mean", "max"], index=0)
-    layer = st.number_input("Layer index (if mode=layer)", value=0, step=1)
-
-    st.divider()
-    st.header("3) Well")
-    well_mode = st.selectbox("Well placement", ["max_k", "center", "manual"], index=1)
-    manual_i = st.number_input("manual i", value=0, step=1)
-    manual_j = st.number_input("manual j", value=0, step=1)
-
-    st.divider()
-    st.header("4) Schedule cleanup (recommended)")
-    q_scale = st.number_input("q scale factor", value=1.0)
-    normalize_q = st.checkbox("Normalize max(|q|)=1", value=False)
-
-    schedule_mode = st.selectbox("Schedule mode", ["auto", "force_resample_dt", "force_expand_segments_dt"], index=0)
-    dt_uniform = st.number_input("Uniform dt (for resample/expand)", value=1.0, min_value=0.01)
-
-    st.divider()
-    st.header("5) Smoothness + metrics")
-    thr_area = st.slider("Area threshold (Sg > thr)", 0.0, 0.5, 0.05, 0.01)
-    sg_smooth_sigma = st.slider("Output smoothing sigma", 0.0, 4.0, 1.2, 0.1)
-    logk_smooth_sigma = st.slider("Smooth log10(k) sigma", 0.0, 4.0, 1.6, 0.1)
-    front_w = st.slider("Front thickness w", 0.5, 6.0, 2.2, 0.1)
-
-    st.divider()
-    run_btn = st.button("Run forward prediction", type="primary")
-
-
-if up_npz is None or up_csv is None:
-    st.info("Upload a phi/k NPZ and a schedule CSV to begin.")
-    st.stop()
-
-# -------------------------
-# Load NPZ
-# -------------------------
-try:
-    phi, k, act_mask, meta_npz = load_npz_diverse(up_npz, mode_3d=mode_3d, layer=int(layer))
-except Exception as e:
-    st.error(f"NPZ load failed: {e}")
-    st.stop()
-
-# -------------------------
-# Load schedule
-# -------------------------
-try:
-    sched = load_schedule_diverse(up_csv)
-    if isinstance(sched[0], pd.DataFrame):  # segments
-        seg_df = sched[0]
-        if schedule_mode == "force_expand_segments_dt":
-            t, q = expand_segments_to_steps(seg_df, dt=float(dt_uniform))
-        else:
-            # auto-expand segments with dt=1 by default
-            t, q = expand_segments_to_steps(seg_df, dt=1.0)
-    else:
-        t, q = sched
-        if schedule_mode == "force_resample_dt":
-            t, q = resample_steps(t, q, dt=float(dt_uniform))
-except Exception as e:
-    st.error(f"Schedule load failed: {e}")
-    st.stop()
-
-q = q.astype(np.float32) * np.float32(q_scale)
-if normalize_q:
-    m = float(np.max(np.abs(q))) if q.size else 1.0
-    if m > 0:
-        q = (q / m).astype(np.float32)
-
-# -------------------------
-# Preview
-# -------------------------
-st.caption(f"NPZ keys used: phi={meta_npz['phi_key']} | k={meta_npz['k_key']} | orig phi shape={meta_npz['orig_phi_shape']} | orig k shape={meta_npz['orig_k_shape']}")
-st.caption(f"dx={meta_npz['dx']}, dy={meta_npz['dy']} (used for area/radius units)")
-
-colA, colB = st.columns(2)
-with colA:
-    st.subheader("phi (porosity)")
-    st.pyplot(fig_imshow(phi, f"phi | {phi.shape}"))
-with colB:
-    st.subheader("k (permeability)")
-    st.pyplot(fig_imshow(k, f"k | {k.shape}"))
-
-# Select well for display
-try:
-    _, k_norm, mask = prepare_phi_k(phi, k, mask=act_mask)
-    well_ij = (int(manual_i), int(manual_j)) if well_mode == "manual" else None
+    phi_norm, k_norm, mask = prepare_phi_k(phi, k)
+    nx, ny = phi.shape
     wi, wj = choose_well_ij(k_norm, mask, well_mode, ij=well_ij)
-    st.caption(f"Selected well (i,j)=({wi},{wj}) | active cells={int(mask.sum())}")
-except Exception as e:
-    st.error(f"Well selection failed: {e}")
-    st.stop()
 
-st.subheader("Schedule")
-st.pyplot(fig_schedule(t, q, tidx=0))
+    t = np.asarray(t, dtype=np.float32).reshape(-1)
+    q = np.asarray(q, dtype=np.float32).reshape(-1)
+    if len(t) != len(q):
+        raise ValueError("t and q must have the same length.")
+    Nt = len(t)
+    if Nt < 2:
+        raise ValueError("Need at least 2 timesteps.")
 
-if not run_btn:
-    st.stop()
+    # Precompute source kernels
+    src = _gauss2d(nx, ny, wi, wj, float(params["src_sigma"]))
+    prod = _gauss2d(nx, ny, wi, wj, float(params["prod_sigma"]))
 
-# -------------------------
-# Run model
-# -------------------------
-params = dict(DEFAULT_PARAMS)
-params["sg_smooth_sigma"] = float(sg_smooth_sigma)
-params["gauss_smooth_sigma"] = float(logk_smooth_sigma)
-params["gauss_w"] = float(front_w)
+    # Pressure width scales with domain
+    dom = float(max(nx, ny))
+    p_sigma = float(params["ap_diff"]) * 0.12 * dom + 1e-6
 
-with st.spinner("Running forward model..."):
-    try:
-        res = run_forward(
-            phi=phi,
-            k=k,
-            t=t,
-            q=q,
-            params=params,
-            well_mode=well_mode,
-            well_ij=(int(manual_i), int(manual_j)) if well_mode == "manual" else None,
-            mask=act_mask,
-            return_pressure=True,
-            thr_area=float(thr_area),
-            dx=float(meta_npz["dx"]),
-            dy=float(meta_npz["dy"]),
-        )
-    except Exception as e:
-        st.error(f"Run failed: {e}")
-        st.stop()
+    # State
+    sg = np.zeros((nx, ny), dtype=np.float32)
+    sg_max = np.zeros((nx, ny), dtype=np.float32)  # for Land trapping
+    sg_list: List[np.ndarray] = []
+    p_list: List[np.ndarray] = []
 
-st.success("Done.")
+    area = np.zeros((Nt,), dtype=np.float32)
+    r_eq = np.zeros((Nt,), dtype=np.float32)
 
-Nt = len(res.sg_list)
-tidx = st.slider("Select timestep (tidx)", 0, max(0, Nt - 1), 0)
+    dt = float(params["dt"])
+    D0 = float(params["D0"])
+    nu = float(params["nu"])
+    mob_exp = float(params["mob_exp"])
+    anisD = float(params["anisD"])
+    Swr = float(params["Swr"])
+    Sgr_max = float(params["Sgr_max"])
+    C_L = float(params["C_L"])
+    prod_frac = float(params["prod_frac"])
+    blur_steps = int(params["blur_steps"])
 
-left, right = st.columns(2)
-with left:
-    st.subheader(f"Sg predicted | tidx={tidx}")
-    st.pyplot(fig_imshow(res.sg_list[tidx], f"Sg predicted | tidx={tidx}", vmin=0.0, vmax=1.0))
-with right:
-    st.subheader(f"Pressure surrogate | tidx={tidx}")
-    p = res.p_list[tidx] if res.p_list is not None else None
-    st.pyplot(fig_imshow(p, f"p predicted | tidx={tidx}"))
+    # Mobility weighting from k_norm
+    mob = np.where(mask, (k_norm ** mob_exp), 0.0).astype(np.float32)
 
+    for n in range(Nt):
+        qq = float(q[n])
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.subheader("q(t)")
-    st.pyplot(fig_schedule(res.t, res.q, tidx=tidx))
-with col2:
-    st.subheader("Plume area")
-    st.pyplot(fig_timeseries(res.t, res.area, "area (dx*dy units)", "Area time series"))
-with col3:
-    st.subheader("Equivalent radius")
-    st.pyplot(fig_timeseries(res.t, res.r_eq, "r_eq (same length unit as dx/dy)", "Equivalent radius"))
+        # Pressure surrogate around well (smooth)
+        p = (float(params["alpha_p"]) * qq) * _gauss2d(nx, ny, wi, wj, p_sigma)
+        p = np.where(mask, p, 0.0).astype(np.float32)
 
+        # Darcy drift v = -mob * grad(p)
+        px, py = _grad2d(p)
+        vx = -mob * px
+        vy = -mob * py
 
-st.subheader("Download results")
-out_npz = io.BytesIO()
-sg_stack = np.stack([np.nan_to_num(s, nan=0.0) for s in res.sg_list], axis=0).astype(np.float32)
-np.savez_compressed(out_npz, sg=sg_stack, t=res.t, q=res.q, area=res.area, r_eq=res.r_eq, dx=res.meta["dx"], dy=res.meta["dy"])
-st.download_button("Download predicted Sg (NPZ)", data=out_npz.getvalue(), file_name="sg_predicted.npz")
+        # Heterogeneous anisotropic diffusion flux = D * grad(sg)
+        sx, sy = _grad2d(sg)
+        Dx = D0 * mob * anisD
+        Dy = D0 * mob / max(anisD, 1e-6)
+        fx = -Dx * sx
+        fy = -Dy * sy
+        diff_term = _div2d(fx, fy)
 
-out_csv = pd.DataFrame({"t": res.t, "q": res.q, "area": res.area, "r_eq": res.r_eq}).to_csv(index=False).encode("utf-8")
-st.download_button("Download time series (CSV)", data=out_csv, file_name="plume_timeseries.csv")
+        # Advection term: -div(v * sg)
+        adv_fx = vx * sg
+        adv_fy = vy * sg
+        adv_term = -_div2d(adv_fx, adv_fy)
+
+        # Source/sink with sign of q
+        if qq >= 0:
+            source = qq * src
+            sink = 0.0
+        else:
+            source = 0.0
+            sink = (-qq) * prod
+
+        # Land trapping: residual depends on max sg seen
+        sg_max = np.maximum(sg_max, sg)
+        sgr = np.minimum(Sgr_max, C_L * sg_max)
+        mobile = np.maximum(0.0, sg - sgr)
+
+        # Production removes mobile component
+        if qq < 0:
+            mobile = np.maximum(0.0, mobile - prod_frac * sink)
+
+        # Update mobile saturation with PDE terms + source
+        mobile_new = mobile + dt * (diff_term + nu * adv_term) + dt * source
+        mobile_new = np.clip(mobile_new, 0.0, 1.0).astype(np.float32)
+
+        # Reconstruct total saturation = mobile + trapped, enforce connate water
+        sg = mobile_new + sgr
+        sg = np.clip(sg, 0.0, 1.0 - Swr).astype(np.float32)
+
+        # Optional denoising to avoid checkerboard / rough edges
+        sg = _blur2d(sg, mask, steps=blur_steps)
+
+        # Safety
+        sg = np.where(mask, sg, 0.0).astype(np.float32)
+        sg = np.nan_to_num(sg, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        sg[sg < float(params["clip_eps"])] = 0.0
+
+        sg_list.append(sg.copy())
+        if return_pressure:
+            p_list.append(p.copy())
+
+        # Metrics
+        plume = (sg > float(thr_area)) & mask
+        a = float(plume.sum())
+        area[n] = a
+        r_eq[n] = float(np.sqrt(a / np.pi)) if a > 0 else 0.0
+
+    return ForwardResult(
+        t=t,
+        q=q,
+        sg_list=sg_list,
+        p_list=p_list if return_pressure else None,
+        area=area,
+        r_eq=r_eq,
+        well_ij=(wi, wj),
+    )
